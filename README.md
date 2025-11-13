@@ -1,3 +1,4 @@
+Last updated on 10/19/2025
 ## RL Transfer: CyberBattleSim → Cyberwheel
 
 Train an RL policy on Microsoft CyberBattleSim (CBS) and zero-shot test it on Cyberwheel (CW) using a unified adapter layer for observations, actions, and rewards.
@@ -62,14 +63,6 @@ PYTHONPATH=/home/ssaika/rl-transfer-sec python3 test_transfer_simple.py
 source .venv_cw/bin/activate
 python -m cyberwheel train train_red.yaml --track False --num-envs 1 --total-timesteps 3000
 ```
-source /home/ssaika/rl-transfer-sec-clean/.venv/bin/activate
-source .venv/bin/activate
-
-PYTHONPATH=/home/ssaika/rl-transfer-sec-clean \
-CW_MODEL_PATH=artifacts/policies/cw_ppo_minimal \
-CBS_SIZE=6 CBS_MULTI_INPUT=1 EVAL_MASK_POLICY=1 \
-ROLLOUT_MODE=policy ROLLOUT_STEPS=200 ROLLOUT_DET=0 \
-python3 /home/ssaika/rl-transfer-sec-clean/eval/rollout_cw_on_cbs.py
 
 
 
