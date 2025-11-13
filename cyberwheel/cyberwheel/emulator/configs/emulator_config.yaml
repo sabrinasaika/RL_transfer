@@ -1,0 +1,17 @@
+firewheel:
+  host:
+    username: ubuntu
+    password: ubuntu
+  siem:
+    username: ubuntu
+    password: ubuntu
+    hostname: siem
+  interface: ens2
+fleet:
+  server-url: https://192.168.100.2:8220
+  enrollment-token: ckhQN1hKRUI5MFUzUDREcVJnNXI6bThlQVNBU0NUbEtscm5wbjhNTnJTZw==
+elastic:
+  username: elastic
+  password: elastic 
+kibana:
+  port: 5601

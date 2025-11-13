@@ -1,0 +1,82 @@
+{
+  "steps": [
+    256,
+    1024,
+    2560,
+    3328,
+    4864
+  ],
+  "scores": [
+    779.5500000000006,
+    747.900000000001,
+    768.950000000001,
+    707.0500000000004,
+    740.2000000000007
+  ],
+  "avg_steps_to_goal": [
+    450.0,
+    450.0,
+    450.0,
+    450.0,
+    450.0
+  ],
+  "success_rate": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+  ],
+  "episode_returns": [
+    [
+      775.5000000000007,
+      783.6000000000007
+    ],
+    [
+      733.0000000000005,
+      762.8000000000014
+    ],
+    [
+      769.5000000000007,
+      768.4000000000011
+    ],
+    [
+      714.0000000000002,
+      700.1000000000006
+    ],
+    [
+      724.9000000000009,
+      755.5000000000005
+    ]
+  ],
+  "episode_returns_random": [
+    [],
+    [],
+    [],
+    [],
+    []
+  ],
+  "scores_random": [
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "avg_steps_to_goal_random": [
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "success_rate_random": [
+    null,
+    null,
+    null,
+    null,
+    null
+  ],
+  "episodes_per_checkpoint": 2,
+  "description": "Cyberwheel checkpoints evaluated on CBS; includes steps-to-goal and success rate"
+}

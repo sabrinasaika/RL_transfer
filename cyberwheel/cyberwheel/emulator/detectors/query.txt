@@ -1,0 +1,28 @@
+"curl -u elastic:elastic -XGET --header 'Content-Type: application/json' 'http://localhost:9200/logs-*/_search?pretty=true' -d '{
+  \"query\": {
+    \"bool\": {
+      \"must\": [{
+        \"bool\": {
+          \"should\": [
+            {\"term\": {\"process.args\": \"ping\"}},
+            {\"term\": {\"process.args\": \"nmap\"}},
+            {\"term\": {\"process.args\": \"/etc/sudoers\"}},
+            {\"term\": {\"process.args\": \"ccencrypt\"}},
+            {\"term\": {\"process.args\": \"ssh\"}}
+          ]}
+        },{
+          \"range\": {
+            \"@timestamp\": {
+              \"gte\": \"now-5m\",
+              \"lt\": \"now\"
+            }
+          }
+        }
+      ]
+    }
+  },
+  \"size\": 10,
+  \"sort\": [
+    {\"@timestamp\": {\"order\": \"desc\"}}
+  ]
+}'"

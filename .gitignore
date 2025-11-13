@@ -1,0 +1,37 @@
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.log
+.ipynb_checkpoints/
+.mypy_cache/
+.pytest_cache/
+
+# Envs & IDE
+.venv/
+.venv*/
+venv/
+.env
+.vscode/
+.idea/
+
+# Build/artifacts
+build/
+dist/
+*.egg-info/
+
+# Big ML stuff (keep out of Git; use LFS if needed)
+data/
+datasets/
+checkpoints/
+models/
+outputs/
+artifacts/wandb/
+wandb_runs/
+runs/
+*.pid
+*.pt
+*.pth
+*.h5
+*.onnx
+EOF
