@@ -1,4 +1,4 @@
-Last updated on 10/19/2025
+Last updated on 10/19/2025 (not maintained)
 ## RL Transfer: CyberBattleSim → Cyberwheel
 
 Train an RL policy on Microsoft CyberBattleSim (CBS) and zero-shot test it on Cyberwheel (CW) using a unified adapter layer for observations, actions, and rewards.
