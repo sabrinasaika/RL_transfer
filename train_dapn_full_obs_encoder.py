@@ -19,7 +19,6 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
 from adapters.unified_env import UnifiedSecEnv
-from adapters.dapn_full_obs_translator import DAPNFullObservationTranslator
 from adapters.dapn_unified_full_obs_translator import DAPNUnifiedFullObsTranslator
 from adapters.dapn_observation_encoder import DAPNDomainAdapter
 from adapters.unified_full_obs_preprocessor import UnifiedFullObsPreprocessor
@@ -273,8 +272,7 @@ def train_dapn_full_obs_encoder(
     learning_rate=0.001,
     device=None,
     save_path="artifacts/transfer_models/dapn_full_obs_encoder.pt",
-    use_3_domains=True,
-    use_unified_encoder=True  # Use single encoder with unified preprocessing
+    use_3_domains=True
 ):
     """
     Train DAPN encoder using full raw observations with adversarial domain adaptation.
@@ -294,38 +292,22 @@ def train_dapn_full_obs_encoder(
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
     
-    if use_unified_encoder:
-        # Use SINGLE encoder with unified preprocessing (follows DAPN master)
-        print("Using SINGLE shared encoder with unified preprocessing (follows DAPN master concept)")
-        unified_dim = 512  # Fixed size for unified representation
-        
-        translator = DAPNUnifiedFullObsTranslator(
-            use_dapn=True,
-            feature_size=feature_size,
-            unified_dim=unified_dim,
-            device=device,
-            use_adversarial=True
-        )
-        
-        # Set to training mode
-        translator.shared_encoder.train()
-        if translator.domain_adapter:
-            translator.domain_adapter.train()
-    else:
-        # Use separate encoders (original approach)
-        print("Using separate encoders for each domain")
-        translator = DAPNFullObservationTranslator(
-            use_dapn=True,
-            feature_size=feature_size,
-            device=device,
-            use_adversarial=True
-        )
-        
-        # Set to training mode
-        translator.cbs_encoder.train()
-        translator.cw_encoder.train()
-        if translator.domain_adapter:
-            translator.domain_adapter.train()
+    # Use SINGLE encoder with unified preprocessing (follows DAPN master)
+    print("Using SINGLE shared encoder with unified preprocessing (follows DAPN master concept)")
+    unified_dim = 512  # Fixed size for unified representation
+    
+    translator = DAPNUnifiedFullObsTranslator(
+        use_dapn=True,
+        feature_size=feature_size,
+        unified_dim=unified_dim,
+        device=device,
+        use_adversarial=True
+    )
+    
+    # Set to training mode
+    translator.shared_encoder.train()
+    if translator.domain_adapter:
+        translator.domain_adapter.train()
     
     print(f"\nFull Observation DAPN Training Setup:")
     print(f"  Source domain (Cyberwheel): {len(source_obs_list)} samples")
@@ -335,10 +317,7 @@ def train_dapn_full_obs_encoder(
     print(f"  Method: Adversarial Domain Adaptation (DANN)\n")
     
     # Compute normalization statistics from data
-    if use_unified_encoder:
-        normalization_max_vals = compute_normalization_stats(translator, source_obs_list, target_obs_list)
-    else:
-        normalization_max_vals = None
+    normalization_max_vals = compute_normalization_stats(translator, source_obs_list, target_obs_list)
     
     # Create dataset
     dataset = FullObservationDataset(source_obs_list, target_obs_list, val_obs_list)
@@ -352,14 +331,8 @@ def train_dapn_full_obs_encoder(
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
     
     # Optimizers
-    if use_unified_encoder:
-        encoder_params = list(translator.shared_encoder.parameters())
-        domain_adapter = translator.domain_adapter
-    else:
-        encoder_params = list(translator.cbs_encoder.parameters())
-        if translator.cw_encoder is not None:
-            encoder_params += list(translator.cw_encoder.parameters())
-        domain_adapter = translator.domain_adapter
+    encoder_params = list(translator.shared_encoder.parameters())
+    domain_adapter = translator.domain_adapter
     
     # Use slightly lower learning rate for encoder to stabilize training
     encoder_lr = learning_rate
@@ -457,29 +430,20 @@ def train_dapn_full_obs_encoder(
                 source_features_disc = []
                 target_features_disc = []
                 for obs in source_obs_batch:
-                    if use_unified_encoder:
-                        unified_vec = translator.preprocessor.preprocess_cw(obs)
-                        max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                        normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                        obs_tensor = torch.from_numpy(normalized).float().to(device)
-                        feat = translator.shared_encoder(obs_tensor)
-                        source_features_disc.append(feat.detach())  # Detach for discriminator
-                    else:
-                        if translator.cw_encoder is not None:
-                            feat = translator.cw_encoder(obs)
-                            source_features_disc.append(feat.detach())
+                    unified_vec = translator.preprocessor.preprocess_cw(obs)
+                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
+                    obs_tensor = torch.from_numpy(normalized).float().to(device)
+                    feat = translator.shared_encoder(obs_tensor)
+                    source_features_disc.append(feat.detach())  # Detach for discriminator
                 
                 for obs in target_obs_batch:
-                    if use_unified_encoder:
-                        unified_vec = translator.preprocessor.preprocess_cbs(obs)
-                        max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                        normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                        obs_tensor = torch.from_numpy(normalized).float().to(device)
-                        feat = translator.shared_encoder(obs_tensor)
-                        target_features_disc.append(feat.detach())  # Detach for discriminator
-                    else:
-                        feat = translator.cbs_encoder(obs)
-                        target_features_disc.append(feat.detach())
+                    unified_vec = translator.preprocessor.preprocess_cbs(obs)
+                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
+                    obs_tensor = torch.from_numpy(normalized).float().to(device)
+                    feat = translator.shared_encoder(obs_tensor)
+                    target_features_disc.append(feat.detach())  # Detach for discriminator
                 
                 source_features_disc = torch.stack(source_features_disc)
                 target_features_disc = torch.stack(target_features_disc)
@@ -488,29 +452,20 @@ def train_dapn_full_obs_encoder(
                 source_features_enc = []
                 target_features_enc = []
                 for obs in source_obs_batch:
-                    if use_unified_encoder:
-                        unified_vec = translator.preprocessor.preprocess_cw(obs)
-                        max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                        normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                        obs_tensor = torch.from_numpy(normalized).float().to(device)
-                        feat = translator.shared_encoder(obs_tensor)
-                        source_features_enc.append(feat)  # Keep gradients for encoder
-                    else:
-                        if translator.cw_encoder is not None:
-                            feat = translator.cw_encoder(obs)
-                            source_features_enc.append(feat)
+                    unified_vec = translator.preprocessor.preprocess_cw(obs)
+                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
+                    obs_tensor = torch.from_numpy(normalized).float().to(device)
+                    feat = translator.shared_encoder(obs_tensor)
+                    source_features_enc.append(feat)  # Keep gradients for encoder
                 
                 for obs in target_obs_batch:
-                    if use_unified_encoder:
-                        unified_vec = translator.preprocessor.preprocess_cbs(obs)
-                        max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                        normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                        obs_tensor = torch.from_numpy(normalized).float().to(device)
-                        feat = translator.shared_encoder(obs_tensor)
-                        target_features_enc.append(feat)  # Keep gradients for encoder
-                    else:
-                        feat = translator.cbs_encoder(obs)
-                        target_features_enc.append(feat)
+                    unified_vec = translator.preprocessor.preprocess_cbs(obs)
+                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
+                    obs_tensor = torch.from_numpy(normalized).float().to(device)
+                    feat = translator.shared_encoder(obs_tensor)
+                    target_features_enc.append(feat)  # Keep gradients for encoder
                 
                 source_features_enc = torch.stack(source_features_enc)
                 target_features_enc = torch.stack(target_features_enc)
@@ -529,7 +484,6 @@ def train_dapn_full_obs_encoder(
             last_target_features = target_features_encoder
             
             # Adversarial domain adaptation
-            domain_adapter = translator.domain_adapter if use_unified_encoder else translator.domain_adapter
             if domain_adapter is not None:
                 # Step 1: Update discriminator (use detached features)
                 if optimizer_adversarial is not None:
@@ -624,29 +578,20 @@ def train_dapn_full_obs_encoder(
             source_features_disc = []
             target_features_disc = []
             for obs in accumulated_source_obs:
-                if use_unified_encoder:
-                    unified_vec = translator.preprocessor.preprocess_cw(obs)
-                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                    obs_tensor = torch.from_numpy(normalized).float().to(device)
-                    feat = translator.shared_encoder(obs_tensor)
-                    source_features_disc.append(feat.detach())
-                else:
-                    if translator.cw_encoder is not None:
-                        feat = translator.cw_encoder(obs)
-                        source_features_disc.append(feat.detach())
+                unified_vec = translator.preprocessor.preprocess_cw(obs)
+                max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
+                obs_tensor = torch.from_numpy(normalized).float().to(device)
+                feat = translator.shared_encoder(obs_tensor)
+                source_features_disc.append(feat.detach())
             
             for obs in accumulated_target_obs:
-                if use_unified_encoder:
-                    unified_vec = translator.preprocessor.preprocess_cbs(obs)
-                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                    obs_tensor = torch.from_numpy(normalized).float().to(device)
-                    feat = translator.shared_encoder(obs_tensor)
-                    target_features_disc.append(feat.detach())
-                else:
-                    feat = translator.cbs_encoder(obs)
-                    target_features_disc.append(feat.detach())
+                unified_vec = translator.preprocessor.preprocess_cbs(obs)
+                max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
+                obs_tensor = torch.from_numpy(normalized).float().to(device)
+                feat = translator.shared_encoder(obs_tensor)
+                target_features_disc.append(feat.detach())
             
             source_features_disc = torch.stack(source_features_disc)
             target_features_disc = torch.stack(target_features_disc)
@@ -655,35 +600,25 @@ def train_dapn_full_obs_encoder(
             source_features_enc = []
             target_features_enc = []
             for obs in accumulated_source_obs:
-                if use_unified_encoder:
-                    unified_vec = translator.preprocessor.preprocess_cw(obs)
-                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                    obs_tensor = torch.from_numpy(normalized).float().to(device)
-                    feat = translator.shared_encoder(obs_tensor)
-                    source_features_enc.append(feat)
-                else:
-                    if translator.cw_encoder is not None:
-                        feat = translator.cw_encoder(obs)
-                        source_features_enc.append(feat)
+                unified_vec = translator.preprocessor.preprocess_cw(obs)
+                max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
+                obs_tensor = torch.from_numpy(normalized).float().to(device)
+                feat = translator.shared_encoder(obs_tensor)
+                source_features_enc.append(feat)
             
             for obs in accumulated_target_obs:
-                if use_unified_encoder:
-                    unified_vec = translator.preprocessor.preprocess_cbs(obs)
-                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                    obs_tensor = torch.from_numpy(normalized).float().to(device)
-                    feat = translator.shared_encoder(obs_tensor)
-                    target_features_enc.append(feat)
-                else:
-                    feat = translator.cbs_encoder(obs)
-                    target_features_enc.append(feat)
+                unified_vec = translator.preprocessor.preprocess_cbs(obs)
+                max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
+                obs_tensor = torch.from_numpy(normalized).float().to(device)
+                feat = translator.shared_encoder(obs_tensor)
+                target_features_enc.append(feat)
             
             source_features_enc = torch.stack(source_features_enc)
             target_features_enc = torch.stack(target_features_enc)
             
             # Process this final batch
-            domain_adapter = translator.domain_adapter if use_unified_encoder else translator.domain_adapter
             if domain_adapter is not None:
                 # Step 1: Update discriminator (use detached features)
                 if optimizer_adversarial is not None:
@@ -788,10 +723,6 @@ if __name__ == "__main__":
     parser.add_argument("--save-encoder", type=str,
                        default="artifacts/transfer_models/dapn_full_obs_encoder.pt",
                        help="Path to save trained encoder")
-    parser.add_argument("--unified-encoder", action="store_true", default=True,
-                       help="Use single shared encoder with unified preprocessing (follows DAPN master)")
-    parser.add_argument("--separate-encoders", action="store_true", default=False,
-                       help="Use separate encoders for each domain")
     parser.add_argument("--cw-agent", type=str, default=None,
                        help="Path to Cyberwheel agent checkpoint")
     parser.add_argument("--cbs-agent", type=str, default=None,
@@ -817,9 +748,6 @@ if __name__ == "__main__":
             cbs_agent_path=args.cbs_agent
         )
     
-    # Determine encoder type
-    use_unified = args.unified_encoder and not args.separate_encoders
-    
     # Guard: DAPN needs both source and target domains
     if len(source_obs_list) == 0 or len(target_obs_list) == 0:
         print("\nERROR: Missing observations for training.")
@@ -838,15 +766,12 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         learning_rate=args.lr,
         save_path=args.save_encoder,
-        use_3_domains=True,
-        use_unified_encoder=use_unified
+        use_3_domains=True
     )
     
     print("\n✓ Training complete!")
     print(f"  Encoder saved to: {args.save_encoder}")
-    print(f"  Encoder type: {'Single shared encoder (follows DAPN master)' if use_unified else 'Separate encoders'}")
+    print(f"  Encoder type: Single shared encoder (follows DAPN master)")
     print(f"\nTo use this encoder, set:")
     print(f"  export DAPN_USE_FULL_OBS=1")
     print(f"  export DAPN_ENCODER_PATH={args.save_encoder}")
-    if use_unified:
-        print(f"  export DAPN_USE_UNIFIED_FULL_OBS=1  # Use unified single encoder")
