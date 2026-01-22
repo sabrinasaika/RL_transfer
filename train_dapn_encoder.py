@@ -1,17 +1,4 @@
-#!/usr/bin/env python3
-"""
-Train encoder with domain alignment (adversarial domain adaptation) only.
 
-This script:
-1. Collects observations from 3 domains:
-   - Source: Cyberwheel
-   - Target: Normal CyberBattleSim
-   - Validation: CBS with Cyberwheel topology
-2. Trains encoders using adversarial domain adaptation to align feature spaces
-3. Saves the trained encoders
-
-Note: This uses only domain alignment, not prototypical networks.
-"""
 
 import os
 import sys
@@ -263,6 +250,13 @@ def train_dapn_encoder(
     print(f"Training on device: {device}")
     
     # Create translator with DAPN
+    # Use shared encoder to follow original DAPN concept (single encoder for both domains)
+    use_shared = os.environ.get("DAPN_USE_SHARED_ENCODER", "1") == "1"
+    if use_shared:
+        print("Using SINGLE shared encoder (follows original DAPN concept)")
+    else:
+        print("Using separate encoders for each domain")
+    
     translator = DAPNObservationTranslator(
         use_dapn=True,
         feature_size=feature_size,
@@ -271,8 +265,11 @@ def train_dapn_encoder(
     )
     
     # Set to training mode
-    translator.cbs_encoder.train()
-    translator.cw_encoder.train()
+    if translator.use_shared_encoder:
+        translator.shared_encoder.train()
+    else:
+        translator.cbs_encoder.train()
+        translator.cw_encoder.train()
     translator.domain_adapter.train()
     
     # Handle domain availability
@@ -312,9 +309,12 @@ def train_dapn_encoder(
         return translator
     
     # Optimizers
-    encoder_params = list(translator.cbs_encoder.parameters())
-    if translator.cw_encoder is not None:
-        encoder_params += list(translator.cw_encoder.parameters())
+    if translator.use_shared_encoder:
+        encoder_params = list(translator.shared_encoder.parameters())
+    else:
+        encoder_params = list(translator.cbs_encoder.parameters())
+        if translator.cw_encoder is not None:
+            encoder_params += list(translator.cw_encoder.parameters())
     
     optimizer_encoder = optim.Adam(encoder_params, lr=learning_rate)
     
@@ -351,9 +351,16 @@ def train_dapn_encoder(
             
             # Encode observations
             # Source = Cyberwheel, Target = Normal CBS, Validation = CBS with CW topology
-            source_features = translator.cw_encoder(obs_batch[source_mask]) if source_mask.any() and translator.cw_encoder else None
-            target_features = translator.cbs_encoder(obs_batch[target_mask]) if target_mask.any() else None
-            val_features = translator.cbs_encoder(obs_batch[val_mask]) if val_mask.any() else None
+            if translator.use_shared_encoder:
+                # Use single shared encoder for all domains
+                source_features = translator.shared_encoder(obs_batch[source_mask]) if source_mask.any() else None
+                target_features = translator.shared_encoder(obs_batch[target_mask]) if target_mask.any() else None
+                val_features = translator.shared_encoder(obs_batch[val_mask]) if val_mask.any() else None
+            else:
+                # Use separate encoders
+                source_features = translator.cw_encoder(obs_batch[source_mask]) if source_mask.any() and translator.cw_encoder else None
+                target_features = translator.cbs_encoder(obs_batch[target_mask]) if target_mask.any() else None
+                val_features = translator.cbs_encoder(obs_batch[val_mask]) if val_mask.any() else None
             
             # Domain alignment: Only use adversarial domain adaptation (no reconstruction loss)
             # The goal is to align source (Cyberwheel) and target (CBS) feature spaces

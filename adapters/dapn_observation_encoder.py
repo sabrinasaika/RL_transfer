@@ -3,6 +3,7 @@ DAPN-based observation encoder for domain adaptation between CBS and Cyberwheel.
 Uses DAPN's domain adaptation principles to align observations from different domains.
 """
 
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -204,24 +205,40 @@ class DAPNObservationTranslator:
         # Default scales for normalization (same as ObservationTranslator)
         self.default_scales = np.array([50, 50, 50, 200, 50, 1000, 20.0, 100], dtype=np.float32)
         
-        # Create encoders for both domains
+        # Create encoder(s) for domain adaptation
+        # Option: Use single shared encoder (follows original DAPN) or separate encoders
+        self.use_shared_encoder = os.environ.get("DAPN_USE_SHARED_ENCODER", "1") == "1"
+        
+        self.shared_encoder = None
         self.cbs_encoder = None
         self.cw_encoder = None
         self.domain_adapter = None
         
         if use_dapn:
-            # Create encoders
-            self.cbs_encoder = DAPNObservationEncoder(
-                input_dim=input_dim,
-                feature_size=feature_size,
-                device=self.device
-            ).to(self.device)
-            
-            self.cw_encoder = DAPNObservationEncoder(
-                input_dim=input_dim,
-                feature_size=feature_size,
-                device=self.device
-            ).to(self.device)
+            if self.use_shared_encoder:
+                # Use SINGLE shared encoder (follows original DAPN concept)
+                # Both domains are converted to unified 8D format first, so one encoder works
+                self.shared_encoder = DAPNObservationEncoder(
+                    input_dim=input_dim,
+                    feature_size=feature_size,
+                    device=self.device
+                ).to(self.device)
+                # For compatibility, also set cbs_encoder and cw_encoder to point to shared
+                self.cbs_encoder = self.shared_encoder
+                self.cw_encoder = self.shared_encoder
+            else:
+                # Use separate encoders (original implementation)
+                self.cbs_encoder = DAPNObservationEncoder(
+                    input_dim=input_dim,
+                    feature_size=feature_size,
+                    device=self.device
+                ).to(self.device)
+                
+                self.cw_encoder = DAPNObservationEncoder(
+                    input_dim=input_dim,
+                    feature_size=feature_size,
+                    device=self.device
+                ).to(self.device)
             
             # Create domain adapter if using adversarial training
             if use_adversarial:
@@ -235,8 +252,11 @@ class DAPNObservationTranslator:
                 self.load_encoder(encoder_path)
             
             # Set to eval mode by default
-            self.cbs_encoder.eval()
-            self.cw_encoder.eval()
+            if self.use_shared_encoder:
+                self.shared_encoder.eval()
+            else:
+                self.cbs_encoder.eval()
+                self.cw_encoder.eval()
             if self.domain_adapter:
                 self.domain_adapter.eval()
     
@@ -245,34 +265,57 @@ class DAPNObservationTranslator:
         try:
             checkpoint = torch.load(encoder_path, map_location=self.device)
             
-            if 'cbs_encoder_state_dict' in checkpoint:
-                self.cbs_encoder.load_state_dict(checkpoint['cbs_encoder_state_dict'])
-            elif 'encoder_state_dict' in checkpoint:
-                # Try loading as shared encoder
-                self.cbs_encoder.load_state_dict(checkpoint['encoder_state_dict'])
-                self.cw_encoder.load_state_dict(checkpoint['encoder_state_dict'])
-            
-            if 'cw_encoder_state_dict' in checkpoint:
-                self.cw_encoder.load_state_dict(checkpoint['cw_encoder_state_dict'])
+            if self.use_shared_encoder:
+                # Load shared encoder
+                if 'shared_encoder_state_dict' in checkpoint:
+                    self.shared_encoder.load_state_dict(checkpoint['shared_encoder_state_dict'])
+                elif 'encoder_state_dict' in checkpoint:
+                    self.shared_encoder.load_state_dict(checkpoint['encoder_state_dict'])
+                elif 'cbs_encoder_state_dict' in checkpoint:
+                    # If only one encoder saved, use it for shared
+                    self.shared_encoder.load_state_dict(checkpoint['cbs_encoder_state_dict'])
+                else:
+                    print(f"Warning: No shared encoder found in checkpoint")
+            else:
+                # Load separate encoders
+                if 'cbs_encoder_state_dict' in checkpoint:
+                    self.cbs_encoder.load_state_dict(checkpoint['cbs_encoder_state_dict'])
+                elif 'encoder_state_dict' in checkpoint:
+                    # Try loading as shared encoder
+                    self.cbs_encoder.load_state_dict(checkpoint['encoder_state_dict'])
+                    self.cw_encoder.load_state_dict(checkpoint['encoder_state_dict'])
+                
+                if 'cw_encoder_state_dict' in checkpoint:
+                    self.cw_encoder.load_state_dict(checkpoint['cw_encoder_state_dict'])
             
             if 'domain_adapter_state_dict' in checkpoint and self.domain_adapter:
                 self.domain_adapter.load_state_dict(checkpoint['domain_adapter_state_dict'])
             
-            print(f"Loaded DAPN encoder from {encoder_path}")
+            print(f"Loaded DAPN encoder from {encoder_path} (shared={self.use_shared_encoder})")
         except Exception as e:
             print(f"Warning: Could not load encoder from {encoder_path}: {e}")
     
     def save_encoder(self, save_path: str):
         """Save encoder weights to checkpoint."""
-        checkpoint = {
-            'cbs_encoder_state_dict': self.cbs_encoder.state_dict() if self.cbs_encoder else None,
-            'cw_encoder_state_dict': self.cw_encoder.state_dict() if self.cw_encoder else None,
-            'domain_adapter_state_dict': self.domain_adapter.state_dict() if self.domain_adapter else None,
-            'feature_size': self.feature_size,
-            'input_dim': self.input_dim
-        }
+        if self.use_shared_encoder:
+            checkpoint = {
+                'shared_encoder_state_dict': self.shared_encoder.state_dict() if self.shared_encoder else None,
+                'domain_adapter_state_dict': self.domain_adapter.state_dict() if self.domain_adapter else None,
+                'feature_size': self.feature_size,
+                'input_dim': self.input_dim,
+                'use_shared_encoder': True
+            }
+        else:
+            checkpoint = {
+                'cbs_encoder_state_dict': self.cbs_encoder.state_dict() if self.cbs_encoder else None,
+                'cw_encoder_state_dict': self.cw_encoder.state_dict() if self.cw_encoder else None,
+                'domain_adapter_state_dict': self.domain_adapter.state_dict() if self.domain_adapter else None,
+                'feature_size': self.feature_size,
+                'input_dim': self.input_dim,
+                'use_shared_encoder': False
+            }
         torch.save(checkpoint, save_path)
-        print(f"Saved DAPN encoder to {save_path}")
+        print(f"Saved DAPN encoder to {save_path} (shared={self.use_shared_encoder})")
     
     def from_cbs(self, obs) -> np.ndarray:
         """
@@ -289,8 +332,10 @@ class DAPNObservationTranslator:
         vec_normalized = self._normalize(vec)
         
         # Encode using DAPN if enabled
-        if self.use_dapn and self.cbs_encoder is not None:
-            return self._encode_to_features(vec_normalized, domain='cbs')
+        if self.use_dapn:
+            encoder = self.shared_encoder if self.use_shared_encoder else self.cbs_encoder
+            if encoder is not None:
+                return self._encode_to_features(vec_normalized, encoder=encoder)
         
         return vec_normalized
     
@@ -309,8 +354,10 @@ class DAPNObservationTranslator:
         vec_normalized = self._normalize(vec)
         
         # Encode using DAPN if enabled
-        if self.use_dapn and self.cw_encoder is not None:
-            return self._encode_to_features(vec_normalized, domain='cw')
+        if self.use_dapn:
+            encoder = self.shared_encoder if self.use_shared_encoder else self.cw_encoder
+            if encoder is not None:
+                return self._encode_to_features(vec_normalized, encoder=encoder)
         
         return vec_normalized
     
@@ -437,18 +484,25 @@ class DAPNObservationTranslator:
         """Normalize observation vector."""
         return np.clip(vec / self.default_scales, 0.0, 1.0)
     
-    def _encode_to_features(self, obs: np.ndarray, domain: str = 'cbs') -> np.ndarray:
+    def _encode_to_features(self, obs: np.ndarray, domain: str = 'cbs', encoder=None) -> np.ndarray:
         """
         Encode observation to feature space using DAPN encoder.
         
         Args:
             obs: Normalized observation vector [input_dim]
-            domain: 'cbs' or 'cw'
+            domain: 'cbs' or 'cw' (used if encoder not provided)
+            encoder: Specific encoder to use (if None, selects based on domain)
         
         Returns:
             features: Encoded features [feature_size]
         """
-        encoder = self.cbs_encoder if domain == 'cbs' else self.cw_encoder
+        if encoder is None:
+            # Fallback to domain-based selection
+            if self.use_shared_encoder:
+                encoder = self.shared_encoder
+            else:
+                encoder = self.cbs_encoder if domain == 'cbs' else self.cw_encoder
+        
         if encoder is None:
             return obs
         

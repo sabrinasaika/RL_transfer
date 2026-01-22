@@ -2,6 +2,7 @@
 Gym wrapper to use DAPN observation encoder with environments.
 """
 
+import os
 import numpy as np
 import gymnasium as gym
 from typing import Optional
@@ -40,17 +41,43 @@ class DAPNEnvWrapper(gym.Wrapper):
         import torch
         torch_device = torch.device(device) if device else None
         
-        self.dapn_translator = DAPNObservationTranslator(
-            use_dapn=use_dapn,
-            encoder_path=encoder_path,
-            feature_size=feature_size,
-            device=torch_device
-        )
+        # Check if we should use full observations (set via env var)
+        use_full_obs = os.environ.get("DAPN_USE_FULL_OBS", "0") == "1"
+        use_unified_full_obs = os.environ.get("DAPN_USE_UNIFIED_FULL_OBS", "0") == "1"
+        
+        if use_full_obs:
+            if use_unified_full_obs:
+                # Use full observations with SINGLE unified encoder (follows DAPN master)
+                from adapters.dapn_unified_full_obs_translator import DAPNUnifiedFullObsTranslator
+                self.dapn_translator = DAPNUnifiedFullObsTranslator(
+                    use_dapn=use_dapn,
+                    encoder_path=encoder_path,
+                    feature_size=feature_size,
+                    device=torch_device
+                )
+            else:
+                # Use full raw observations with separate encoders
+                from adapters.dapn_full_obs_translator import DAPNFullObservationTranslator
+                self.dapn_translator = DAPNFullObservationTranslator(
+                    use_dapn=use_dapn,
+                    encoder_path=encoder_path,
+                    feature_size=feature_size,
+                    device=torch_device
+                )
+        else:
+            # Use 8D unified format with DAPN (default)
+            self.dapn_translator = DAPNObservationTranslator(
+                use_dapn=use_dapn,
+                encoder_path=encoder_path,
+                feature_size=feature_size,
+                device=torch_device
+            )
         
         # Replace the environment's observation translator
         self.env.obs_t = self.dapn_translator
         
         # Update observation space to match DAPN feature size
+        # For transfer learning consistency, always use Dict format when DAPN is enabled
         from gymnasium import spaces
         if isinstance(self.observation_space, gym.spaces.Dict):
             # Keep mask, update obs dimension
@@ -64,13 +91,25 @@ class DAPNEnvWrapper(gym.Wrapper):
                 )
             })
         else:
-            # Convert Box to feature size
-            self.observation_space = spaces.Box(
-                low=0.0,
-                high=1.0,
-                shape=(feature_size,),
-                dtype=np.float32
-            )
+            # Convert Box to Dict format for consistency with transfer learning
+            # This ensures models trained on Cyberwheel with DAPN can transfer to CBS
+            # Create a dummy mask (all ones) for environments without action masking
+            from adapters.action_translator import ActionTranslator
+            num_actions = len(ActionTranslator().unified_actions)
+            self.observation_space = spaces.Dict({
+                'obs': spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(feature_size,),
+                    dtype=np.float32
+                ),
+                'mask': spaces.Box(
+                    low=0.0,
+                    high=1.0,
+                    shape=(num_actions,),
+                    dtype=np.float32
+                )
+            })
     
     def reset(self, **kwargs):
         """Reset environment and encode observation with DAPN."""
@@ -108,12 +147,21 @@ class DAPNEnvWrapper(gym.Wrapper):
         if not isinstance(encoded, np.ndarray):
             encoded = np.array(encoded, dtype=np.float32)
         
-        # Handle multi-input format (with mask)
+        # Always return Dict format when DAPN is enabled (for transfer learning consistency)
         if isinstance(obs, dict) and 'mask' in obs:
+            # Keep existing mask from environment
             return {
                 'obs': encoded,
                 'mask': obs['mask']
             }
-        
-        return encoded
+        else:
+            # Create a dummy mask (all ones) for environments without action masking
+            # This ensures consistency between Cyberwheel and CBS when using DAPN
+            from adapters.action_translator import ActionTranslator
+            num_actions = len(ActionTranslator().unified_actions)
+            mask = np.ones(num_actions, dtype=np.float32)
+            return {
+                'obs': encoded,
+                'mask': mask
+            }
 
