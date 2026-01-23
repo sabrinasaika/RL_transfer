@@ -252,14 +252,63 @@ def compute_normalization_stats(translator, source_obs_list, target_obs_list, sa
     
     if len(unified_vecs) > 0:
         all_vecs = np.stack(unified_vecs)
+        # Compute actual max values per dimension
         max_vals = np.max(np.abs(all_vecs), axis=0)
-        # Add small epsilon to avoid division by zero, and ensure minimum value
-        max_vals = np.maximum(max_vals, 1.0)
-        print(f"  Computed max values: min={max_vals.min():.2f}, max={max_vals.max():.2f}, mean={max_vals.mean():.2f}")
+        
+        # Check if values are already very small (normalized or mostly zeros)
+        actual_max = max_vals.max()
+        actual_mean = np.abs(all_vecs).mean()
+        
+        print(f"  Input value ranges: min={all_vecs.min():.4f}, max={all_vecs.max():.4f}, mean={all_vecs.mean():.4f}, abs_max={actual_max:.4f}")
+        
+        # Check if values are in [-1, 1] range (already normalized but with negatives)
+        if all_vecs.min() >= -1.1 and all_vecs.max() <= 1.1:
+            # Values are in [-1, 1] range, convert to [0, 1] for encoder
+            # Use standard normalization: (x - min) / (max - min) -> [0, 1]
+            # But we'll use a simpler approach: (x + 1) / 2 -> [0, 1]
+            print(f"  Values are in [-1, 1] range, will convert to [0, 1] during normalization")
+            # Set max_vals to 2.0 so that (x + 1) / 2 maps [-1, 1] -> [0, 1]
+            max_vals = np.ones_like(max_vals) * 2.0
+        elif actual_max < 2.0:
+            # Values are likely already normalized in [0, 1] or very small
+            # Use 99th percentile to be robust to outliers
+            percentile_99 = np.percentile(np.abs(all_vecs), 99, axis=0)
+            max_vals = np.maximum(max_vals, percentile_99)
+            # Scale up if values are too small
+            if actual_max < 0.1:
+                # Values are very small, scale them up
+                scale_factor = 10.0 / actual_max if actual_max > 0 else 100.0
+                max_vals = max_vals * scale_factor
+                print(f"  Values are very small, scaling by {scale_factor:.2f}x")
+        else:
+            # Values are in natural range, use them as-is
+            pass
+        
+        # Ensure minimum value to avoid division by zero, but preserve scale
+        # Only set minimum if the actual max is very small
+        if actual_max < 0.01:
+            max_vals = np.maximum(max_vals, 1.0)  # Force to 1.0 only if values are tiny
+        else:
+            max_vals = np.maximum(max_vals, actual_max * 0.01)  # At least 1% of actual max
+        
+        print(f"  Computed max values: min={max_vals.min():.4f}, max={max_vals.max():.4f}, mean={max_vals.mean():.4f}")
         return max_vals.astype(np.float32)
     else:
         print("  Warning: Could not compute stats, using default normalization")
         return np.ones(translator.unified_dim, dtype=np.float32) * 100.0
+
+
+def normalize_observation(unified_vec, max_vals):
+    """
+    Normalize observation vector to [0, 1] range.
+    Handles both [-1, 1] -> [0, 1] conversion and standard normalization.
+    """
+    # Handle [-1, 1] -> [0, 1] conversion if max_vals is 2.0
+    if len(max_vals) > 0 and max_vals[0] == 2.0:  # Detected [-1, 1] range
+        normalized = np.clip((unified_vec + 1.0) / 2.0, 0.0, 1.0)
+    else:
+        normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
+    return normalized
 
 
 def train_dapn_full_obs_encoder(
@@ -340,20 +389,75 @@ def train_dapn_full_obs_encoder(
     
     optimizer_adversarial = None
     if domain_adapter is not None:
-        # Use same or slightly higher LR for discriminator (standard DANN practice)
-        discriminator_lr = learning_rate * 1.0  # Same rate, can be adjusted
+        # Use slower learning rate for discriminator to prevent it from becoming too good too fast
+        # This allows the encoder time to align features before discriminator becomes perfect
+        discriminator_lr = learning_rate * 0.1  # 10x slower than encoder (same as working 8D version)
         optimizer_adversarial = optim.Adam(
             domain_adapter.parameters(),
             lr=discriminator_lr,
             weight_decay=1e-5
         )
-        print(f"Discriminator learning rate: {discriminator_lr:.6f} (encoder: {encoder_lr:.6f})")
+        print(f"Discriminator learning rate: {discriminator_lr:.6f} (encoder: {encoder_lr:.6f}, 10x slower)")
     
     # Loss functions
     bce_loss = nn.BCELoss()
     mse_loss = nn.MSELoss()
     
-    print(f"Training for {num_epochs} epochs...")
+    # Check initial feature statistics to verify domains are distinguishable
+    print("\nChecking initial feature statistics...")
+    sample_size = min(50, len(source_obs_list), len(target_obs_list))
+    if sample_size > 0:
+        sample_source = source_obs_list[:sample_size]
+        sample_target = target_obs_list[:sample_size]
+        
+        source_feats = []
+        target_feats = []
+        for obs in sample_source:
+            try:
+                unified_vec = translator.preprocessor.preprocess_cw(obs)
+                max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                normalized = normalize_observation(unified_vec, max_vals)
+                obs_tensor = torch.from_numpy(normalized).float().to(device)
+                with torch.no_grad():
+                    feat = translator.shared_encoder(obs_tensor)
+                    source_feats.append(feat.cpu().numpy())
+            except:
+                pass
+        
+        for obs in sample_target:
+            try:
+                unified_vec = translator.preprocessor.preprocess_cbs(obs)
+                max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
+                normalized = normalize_observation(unified_vec, max_vals)
+                obs_tensor = torch.from_numpy(normalized).float().to(device)
+                with torch.no_grad():
+                    feat = translator.shared_encoder(obs_tensor)
+                    target_feats.append(feat.cpu().numpy())
+            except:
+                pass
+        
+        if len(source_feats) > 0 and len(target_feats) > 0:
+            source_feats = np.array(source_feats)
+            target_feats = np.array(target_feats)
+            src_mean = source_feats.mean(axis=0)
+            tgt_mean = target_feats.mean(axis=0)
+            src_std = source_feats.std(axis=0)
+            tgt_std = target_feats.std(axis=0)
+            
+            # Check if features are distinguishable
+            mean_diff = np.abs(src_mean - tgt_mean).mean()
+            std_diff = np.abs(src_std - tgt_std).mean()
+            
+            print(f"  Source features: μ={src_mean.mean():.4f}, σ={src_std.mean():.4f}")
+            print(f"  Target features: μ={tgt_mean.mean():.4f}, σ={tgt_std.mean():.4f}")
+            print(f"  Mean difference: {mean_diff:.4f}, Std difference: {std_diff:.4f}")
+            
+            if mean_diff < 0.01 and std_diff < 0.01:
+                print("  WARNING: Features are very similar! Domains may not be distinguishable.")
+            else:
+                print("  Features appear distinguishable between domains.")
+    
+    print(f"\nTraining for {num_epochs} epochs...")
     print(f"Total batches per epoch: ~{len(dataloader)}")
     print("-" * 80)
     import sys
@@ -376,9 +480,9 @@ def train_dapn_full_obs_encoder(
         accumulated_source_obs = []
         accumulated_target_obs = []
         
-        # Progress bar for epoch (disabled to keep output clean and avoid hiding prints)
+        # Progress bar for epoch (enabled to show progress)
         from tqdm import tqdm
-        epoch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False, ncols=80, disable=True)
+        epoch_pbar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False, ncols=80, disable=False)
         
         for batch_idx, (obs_batch, domain_labels) in enumerate(epoch_pbar):
             domain_labels = domain_labels.to(device)
@@ -407,6 +511,12 @@ def train_dapn_full_obs_encoder(
             accumulated_source_obs.extend(batch_source_obs)
             accumulated_target_obs.extend(batch_target_obs)
             
+            # Update progress bar to show accumulation status
+            epoch_pbar.set_postfix({
+                'src': len(accumulated_source_obs),
+                'tgt': len(accumulated_target_obs)
+            })
+            
             # Process when we have both source and target observations
             # Limit batch size to prevent memory issues (process in chunks of max 64)
             max_batch_size = 64
@@ -426,55 +536,34 @@ def train_dapn_full_obs_encoder(
                 accumulated_source_obs = accumulated_source_obs[num_to_process:]
                 accumulated_target_obs = accumulated_target_obs[num_to_process:]
                 
-                # Encode observations fresh for discriminator update
-                source_features_disc = []
-                target_features_disc = []
+                # Encode observations in BATCHES (like working 8D version) - much faster and fixes BatchNorm
+                # Preprocess all observations first
+                source_unified_vecs = []
                 for obs in source_obs_batch:
                     unified_vec = translator.preprocessor.preprocess_cw(obs)
                     max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                    obs_tensor = torch.from_numpy(normalized).float().to(device)
-                    feat = translator.shared_encoder(obs_tensor)
-                    source_features_disc.append(feat.detach())  # Detach for discriminator
+                    normalized = normalize_observation(unified_vec, max_vals)
+                    source_unified_vecs.append(normalized)
                 
+                target_unified_vecs = []
                 for obs in target_obs_batch:
                     unified_vec = translator.preprocessor.preprocess_cbs(obs)
                     max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                    obs_tensor = torch.from_numpy(normalized).float().to(device)
-                    feat = translator.shared_encoder(obs_tensor)
-                    target_features_disc.append(feat.detach())  # Detach for discriminator
+                    normalized = normalize_observation(unified_vec, max_vals)
+                    target_unified_vecs.append(normalized)
                 
-                source_features_disc = torch.stack(source_features_disc)
-                target_features_disc = torch.stack(target_features_disc)
+                # Convert to batch tensors and encode in batch (like 8D version)
+                if len(source_unified_vecs) > 0:
+                    source_batch_tensor = torch.from_numpy(np.array(source_unified_vecs)).float().to(device)
+                    source_features_encoder = translator.shared_encoder(source_batch_tensor)
+                else:
+                    source_features_encoder = None
                 
-                # Encode observations fresh for encoder update (with gradients)
-                source_features_enc = []
-                target_features_enc = []
-                for obs in source_obs_batch:
-                    unified_vec = translator.preprocessor.preprocess_cw(obs)
-                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                    obs_tensor = torch.from_numpy(normalized).float().to(device)
-                    feat = translator.shared_encoder(obs_tensor)
-                    source_features_enc.append(feat)  # Keep gradients for encoder
-                
-                for obs in target_obs_batch:
-                    unified_vec = translator.preprocessor.preprocess_cbs(obs)
-                    max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                    normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                    obs_tensor = torch.from_numpy(normalized).float().to(device)
-                    feat = translator.shared_encoder(obs_tensor)
-                    target_features_enc.append(feat)  # Keep gradients for encoder
-                
-                source_features_enc = torch.stack(source_features_enc)
-                target_features_enc = torch.stack(target_features_enc)
-                
-                # Use different feature tensors for discriminator and encoder
-                source_features = source_features_disc  # For discriminator (detached)
-                target_features = target_features_disc  # For discriminator (detached)
-                source_features_encoder = source_features_enc  # For encoder (with gradients)
-                target_features_encoder = target_features_enc  # For encoder (with gradients)
+                if len(target_unified_vecs) > 0:
+                    target_batch_tensor = torch.from_numpy(np.array(target_unified_vecs)).float().to(device)
+                    target_features_encoder = translator.shared_encoder(target_batch_tensor)
+                else:
+                    target_features_encoder = None
             else:
                 # Skip this iteration if we don't have both domains yet
                 continue
@@ -483,198 +572,227 @@ def train_dapn_full_obs_encoder(
             last_source_features = source_features_encoder
             last_target_features = target_features_encoder
             
-            # Adversarial domain adaptation
+            # Adversarial domain adaptation - EXACTLY like working 8D version
             if domain_adapter is not None:
-                # Step 1: Update discriminator (use detached features)
-                if optimizer_adversarial is not None:
-                    optimizer_adversarial.zero_grad()
-                    all_features_detached = torch.cat([source_features, target_features], dim=0)
-                    domain_targets = torch.cat([
-                        torch.zeros(source_features.size(0), 1).to(device),
-                        torch.ones(target_features.size(0), 1).to(device)
-                    ], dim=0)
-                    
-                    domain_pred = domain_adapter(all_features_detached)
-                    discriminator_loss = bce_loss(domain_pred, domain_targets)
-                    discriminator_loss.backward()
-                    # Gradient clipping for stability
-                    torch.nn.utils.clip_grad_norm_(domain_adapter.parameters(), max_norm=1.0)
-                    optimizer_adversarial.step()
-                    
-                    # Calculate discriminator accuracy
-                    pred_labels = (domain_pred > 0.5).float()
-                    disc_acc = (pred_labels == domain_targets).float().mean().item()
-                    total_discriminator_acc += disc_acc
-                    total_discriminator_loss += discriminator_loss.item()
-                    num_discriminator_updates += 1
-                else:
-                    discriminator_loss = None
+                # Detach features for adversarial network update (to avoid gradient issues)
+                # We'll use detached features for adversarial network, but original for encoder update
+                all_features_detached = torch.cat([source_features_encoder.detach(), target_features_encoder.detach()], dim=0)
+                all_features_for_encoder = torch.cat([source_features_encoder, target_features_encoder], dim=0)
                 
-                # Step 2: Update encoder(s) (confuse discriminator, use fresh features with gradients)
-                optimizer_encoder.zero_grad()
-                all_features_encoder = torch.cat([source_features_encoder, target_features_encoder], dim=0)
-                domain_targets_encoder = torch.cat([
+                # Create domain labels: 0 for source (Cyberwheel), 1 for target (CBS)
+                domain_targets = torch.cat([
                     torch.zeros(source_features_encoder.size(0), 1).to(device),
                     torch.ones(target_features_encoder.size(0), 1).to(device)
                 ], dim=0)
-                domain_pred_encoder = domain_adapter(all_features_encoder)
                 
-                # Invert targets to confuse discriminator (standard DANN approach)
-                inverted_targets = 1.0 - domain_targets_encoder
-                encoder_loss = bce_loss(domain_pred_encoder, inverted_targets)
+                # Step 1: Update adversarial network to maximize domain discrimination
+                if optimizer_adversarial is not None:
+                    optimizer_adversarial.zero_grad()
+                    domain_pred_adv = domain_adapter(all_features_detached)
+                    
+                    # Clamp predictions to prevent numerical issues
+                    domain_pred_adv = torch.clamp(domain_pred_adv, 1e-7, 1.0 - 1e-7)
+                    
+                    adv_loss = bce_loss(domain_pred_adv, domain_targets)
+                    
+                    # Check if loss is valid
+                    if adv_loss.item() > 10.0 or adv_loss.item() < 0.0:
+                        print(f"WARNING: Invalid discriminator loss: {adv_loss.item()}")
+                        print(f"  domain_pred_adv range: [{domain_pred_adv.min().item():.4f}, {domain_pred_adv.max().item():.4f}]")
+                        # Reset discriminator if loss is invalid
+                        for m in domain_adapter.modules():
+                            if isinstance(m, nn.Linear):
+                                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                                if m.bias is not None:
+                                    nn.init.zeros_(m.bias)
+                        # Recompute with reset discriminator
+                        domain_pred_adv = domain_adapter(all_features_detached)
+                        domain_pred_adv = torch.clamp(domain_pred_adv, 1e-7, 1.0 - 1e-7)
+                        adv_loss = bce_loss(domain_pred_adv, domain_targets)
+                    
+                    adv_loss.backward()
+                    # Gradient clipping for discriminator
+                    torch.nn.utils.clip_grad_norm_(domain_adapter.parameters(), max_norm=1.0)
+                    optimizer_adversarial.step()
+                    
+                    # Calculate discriminator accuracy for logging
+                    pred_labels = (domain_pred_adv > 0.5).float()
+                    disc_acc = (pred_labels == domain_targets).float().mean().item()
+                    total_discriminator_acc += disc_acc
+                    total_discriminator_loss += adv_loss.item()
+                    num_discriminator_updates += 1
+                else:
+                    adv_loss = None
                 
-                # Also compute adversarial loss for logging (what discriminator would predict)
-                adversarial_loss = bce_loss(domain_pred_encoder, domain_targets_encoder)
+                # Step 2: Compute adversarial loss for encoder (to confuse discriminator)
+                # Use non-detached features so gradients flow to encoders
+                # Note: Discriminator was just updated, so we need to recompute predictions
+                domain_pred_encoder = domain_adapter(all_features_for_encoder)
                 
-                # Add feature matching regularization if discriminator is too good
-                if adversarial_loss.item() < 0.1:
-                    feature_match = 0.1 * mse_loss(
+                # Clamp predictions to prevent numerical issues (shouldn't be needed but safety check)
+                domain_pred_encoder = torch.clamp(domain_pred_encoder, 1e-7, 1.0 - 1e-7)
+                
+                adv_loss_for_encoder = bce_loss(domain_pred_encoder, domain_targets)
+                
+                # Debug: Check if loss is valid and discriminator is saturated
+                if adv_loss_for_encoder.item() > 10.0 or adv_loss_for_encoder.item() < 0.0:
+                    print(f"WARNING: Invalid adversarial loss: {adv_loss_for_encoder.item()}")
+                    print(f"  domain_pred_encoder range: [{domain_pred_encoder.min().item():.4f}, {domain_pred_encoder.max().item():.4f}]")
+                    print(f"  domain_targets range: [{domain_targets.min().item():.4f}, {domain_targets.max().item():.4f}]")
+                    print(f"  Features require_grad: {all_features_for_encoder.requires_grad}")
+                    print(f"  Encoder training mode: {translator.shared_encoder.training}")
+                    print(f"  Feature stats - Source: mean={source_features_encoder.mean().item():.4f}, std={source_features_encoder.std().item():.4f}")
+                    print(f"  Feature stats - Target: mean={target_features_encoder.mean().item():.4f}, std={target_features_encoder.std().item():.4f}")
+                
+                # Check if discriminator is saturated (all predictions same)
+                pred_std = domain_pred_encoder.std().item()
+                if pred_std < 1e-6:
+                    print(f"WARNING: Discriminator saturated! All predictions={domain_pred_encoder[0].item():.4f}, std={pred_std:.6f}")
+                    # Reset discriminator to break saturation
+                    for m in domain_adapter.modules():
+                        if isinstance(m, nn.Linear):
+                            nn.init.xavier_uniform_(m.weight, gain=0.1)
+                            if m.bias is not None:
+                                nn.init.zeros_(m.bias)
+                
+                # Total loss: Only adversarial (inverted for domain confusion) - EXACTLY like 8D version
+                # We want encoders to produce features that confuse the domain discriminator
+                total_batch_loss = 1.0 - adv_loss_for_encoder
+                
+                # Add a small regularization to prevent the loss from being exactly 1.0
+                # This ensures gradients flow even when discriminator is very good
+                if adv_loss_for_encoder.item() < 0.01:
+                    # If discriminator is too good, add a small penalty to encourage feature alignment
+                    total_batch_loss = total_batch_loss + 0.1 * mse_loss(
                         source_features_encoder.mean(dim=0), target_features_encoder.mean(dim=0)
                     )
-                    encoder_loss = encoder_loss + feature_match
                 
-                encoder_loss.backward()
-                # Gradient clipping for stability
-                torch.nn.utils.clip_grad_norm_(encoder_params, max_norm=1.0)
+                # Update encoder
+                optimizer_encoder.zero_grad()
+                total_batch_loss.backward()
+                
+                # Check if gradients exist before stepping
+                has_gradients = False
+                for p in encoder_params:
+                    if p.grad is not None and p.grad.abs().sum() > 0:
+                        has_gradients = True
+                        break
+                
+                if not has_gradients:
+                    print(f"WARNING: No gradients detected! Loss={total_batch_loss.item():.4f}, adv_loss={adv_loss_for_encoder.item():.4f}")
+                    print(f"  Features require_grad: {all_features_for_encoder.requires_grad}")
+                    print(f"  Encoder training: {translator.shared_encoder.training}")
+                
                 optimizer_encoder.step()
                 
-                total_loss += encoder_loss.item()
-                total_adversarial_loss += adversarial_loss.item()
-                if discriminator_loss is not None:
-                    total_adv_loss += discriminator_loss.item()  # Keep for backward compatibility
-                
-                # Update progress bar with current metrics (every batch)
-                if optimizer_adversarial is not None:
-                    current_encoder_loss = encoder_loss.item()
-                    current_disc_loss = discriminator_loss.item()
-                    current_adv_loss = adversarial_loss.item()
-                    current_disc_acc = disc_acc
-                    epoch_pbar.set_postfix({
-                        'loss': f'{current_encoder_loss:.4f}',
-                        'adv': f'{current_adv_loss:.4f}'
-                    })
+                # Track losses for logging
+                total_loss += total_batch_loss.item()
+                # Use discriminator loss for adversarial loss tracking (what discriminator sees)
+                if adv_loss is not None:
+                    total_adversarial_loss += adv_loss.item()
                 else:
-                    current_encoder_loss = encoder_loss.item()
-                    current_adv_loss = adversarial_loss.item()
-                    epoch_pbar.set_postfix({
-                        'loss': f'{current_encoder_loss:.4f}',
-                        'adv': f'{current_adv_loss:.4f}'
-                    })
-            else:
-                # Fallback: feature matching
+                    # Fallback: use encoder adversarial loss (but this is what encoder sees, not discriminator)
+                    total_adversarial_loss += adv_loss_for_encoder.item()
+                
+                num_batches += 1
+            elif source_features_encoder is not None and target_features_encoder is not None:
+                # Fallback: if no domain adapter, use a simple feature matching loss
                 optimizer_encoder.zero_grad()
                 match_loss = mse_loss(
-                    source_features.mean(dim=0), target_features.mean(dim=0)
+                    source_features_encoder.mean(dim=0, keepdim=False), 
+                    target_features_encoder.mean(dim=0, keepdim=False)
                 )
                 match_loss.backward()
                 optimizer_encoder.step()
                 total_loss += match_loss.item()
-            
-            num_batches += 1
+                num_batches += 1
         
         # Process any remaining accumulated observations at the end of the epoch
         if len(accumulated_source_obs) > 0 and len(accumulated_target_obs) > 0:
-            # Encode observations fresh for discriminator (detached)
-            source_features_disc = []
-            target_features_disc = []
+            # Preprocess all observations first
+            source_unified_vecs = []
             for obs in accumulated_source_obs:
                 unified_vec = translator.preprocessor.preprocess_cw(obs)
                 max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                obs_tensor = torch.from_numpy(normalized).float().to(device)
-                feat = translator.shared_encoder(obs_tensor)
-                source_features_disc.append(feat.detach())
+                normalized = normalize_observation(unified_vec, max_vals)
+                source_unified_vecs.append(normalized)
             
+            target_unified_vecs = []
             for obs in accumulated_target_obs:
                 unified_vec = translator.preprocessor.preprocess_cbs(obs)
                 max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                obs_tensor = torch.from_numpy(normalized).float().to(device)
-                feat = translator.shared_encoder(obs_tensor)
-                target_features_disc.append(feat.detach())
+                normalized = normalize_observation(unified_vec, max_vals)
+                target_unified_vecs.append(normalized)
             
-            source_features_disc = torch.stack(source_features_disc)
-            target_features_disc = torch.stack(target_features_disc)
+            # Convert to batch tensors and encode in batch (like 8D version)
+            if len(source_unified_vecs) > 0:
+                source_batch_tensor = torch.from_numpy(np.array(source_unified_vecs)).float().to(device)
+                source_features_enc = translator.shared_encoder(source_batch_tensor)
+            else:
+                source_features_enc = None
             
-            # Encode observations fresh for encoder (with gradients)
-            source_features_enc = []
-            target_features_enc = []
-            for obs in accumulated_source_obs:
-                unified_vec = translator.preprocessor.preprocess_cw(obs)
-                max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                obs_tensor = torch.from_numpy(normalized).float().to(device)
-                feat = translator.shared_encoder(obs_tensor)
-                source_features_enc.append(feat)
+            if len(target_unified_vecs) > 0:
+                target_batch_tensor = torch.from_numpy(np.array(target_unified_vecs)).float().to(device)
+                target_features_enc = translator.shared_encoder(target_batch_tensor)
+            else:
+                target_features_enc = None
             
-            for obs in accumulated_target_obs:
-                unified_vec = translator.preprocessor.preprocess_cbs(obs)
-                max_vals = normalization_max_vals if normalization_max_vals is not None else np.ones(len(unified_vec), dtype=np.float32) * 100.0
-                normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-                obs_tensor = torch.from_numpy(normalized).float().to(device)
-                feat = translator.shared_encoder(obs_tensor)
-                target_features_enc.append(feat)
-            
-            source_features_enc = torch.stack(source_features_enc)
-            target_features_enc = torch.stack(target_features_enc)
-            
-            # Process this final batch
+            # Process this final batch - EXACTLY like working 8D version
             if domain_adapter is not None:
-                # Step 1: Update discriminator (use detached features)
-                if optimizer_adversarial is not None:
-                    optimizer_adversarial.zero_grad()
-                    all_features_detached = torch.cat([source_features_disc, target_features_disc], dim=0)
-                    domain_targets = torch.cat([
-                        torch.zeros(source_features_disc.size(0), 1).to(device),
-                        torch.ones(target_features_disc.size(0), 1).to(device)
-                    ], dim=0)
-                    
-                    domain_pred = domain_adapter(all_features_detached)
-                    discriminator_loss = bce_loss(domain_pred, domain_targets)
-                    discriminator_loss.backward()
-                    optimizer_adversarial.step()
-                    
-                    disc_acc = ((domain_pred > 0.5).float() == domain_targets).float().mean().item()
-                    total_discriminator_acc += disc_acc
-                    total_discriminator_loss += discriminator_loss.item()
-                    num_discriminator_updates += 1
+                # Detach features for adversarial network update
+                all_features_detached = torch.cat([source_features_enc.detach(), target_features_enc.detach()], dim=0)
+                all_features_for_encoder = torch.cat([source_features_enc, target_features_enc], dim=0)
                 
-                # Step 2: Update encoder (use fresh features with gradients)
-                optimizer_encoder.zero_grad()
-                all_features_encoder = torch.cat([source_features_enc, target_features_enc], dim=0)
-                domain_targets_encoder = torch.cat([
+                domain_targets = torch.cat([
                     torch.zeros(source_features_enc.size(0), 1).to(device),
                     torch.ones(target_features_enc.size(0), 1).to(device)
                 ], dim=0)
-                domain_pred_encoder = domain_adapter(all_features_encoder)
                 
-                # Invert targets to confuse discriminator
-                inverted_targets = 1.0 - domain_targets_encoder
-                encoder_loss = bce_loss(domain_pred_encoder, inverted_targets)
+                # Step 1: Update adversarial network
+                if optimizer_adversarial is not None:
+                    optimizer_adversarial.zero_grad()
+                    domain_pred_adv = domain_adapter(all_features_detached)
+                    adv_loss = bce_loss(domain_pred_adv, domain_targets)
+                    adv_loss.backward()
+                    optimizer_adversarial.step()
+                    
+                    disc_acc = ((domain_pred_adv > 0.5).float() == domain_targets).float().mean().item()
+                    total_discriminator_acc += disc_acc
+                    total_discriminator_loss += adv_loss.item()
+                    num_discriminator_updates += 1
+                else:
+                    adv_loss = None
                 
-                # Also compute adversarial loss for logging
-                adversarial_loss = bce_loss(domain_pred_encoder, domain_targets_encoder)
+                # Step 2: Compute adversarial loss for encoder
+                domain_pred_encoder = domain_adapter(all_features_for_encoder)
+                adv_loss_for_encoder = bce_loss(domain_pred_encoder, domain_targets)
                 
-                if adversarial_loss.item() < 0.1:
-                    feature_match = 0.1 * mse_loss(
+                # Total loss: Only adversarial (inverted for domain confusion) - EXACTLY like 8D version
+                total_batch_loss = 1.0 - adv_loss_for_encoder
+                
+                if adv_loss_for_encoder.item() < 0.01:
+                    total_batch_loss = total_batch_loss + 0.1 * mse_loss(
                         source_features_enc.mean(dim=0), target_features_enc.mean(dim=0)
                     )
-                    encoder_loss = encoder_loss + feature_match
                 
-                encoder_loss.backward()
-                # Gradient clipping for stability
-                torch.nn.utils.clip_grad_norm_(encoder_params, max_norm=1.0)
+                # Update encoder
+                optimizer_encoder.zero_grad()
+                total_batch_loss.backward()
                 optimizer_encoder.step()
                 
-                total_loss += encoder_loss.item()
-                total_adversarial_loss += adversarial_loss.item()
+                total_loss += total_batch_loss.item()
+                if adv_loss is not None:
+                    total_adversarial_loss += adv_loss.item()
+                elif adv_loss_for_encoder is not None:
+                    total_adversarial_loss += adv_loss_for_encoder.item()
                 num_batches += 1
         
         # Calculate averages (handle case where num_batches might be 0)
         if num_batches > 0:
             avg_encoder_loss = total_loss / num_batches
             avg_discriminator_loss = total_discriminator_loss / num_discriminator_updates if num_discriminator_updates > 0 else 0.0
-            avg_adversarial_loss = total_adversarial_loss / num_batches
+            # Adversarial loss should be averaged over batches (it's computed for each batch)
+            avg_adversarial_loss = total_adversarial_loss / num_batches if num_batches > 0 else 0.0
             avg_disc_acc = total_discriminator_acc / num_discriminator_updates if num_discriminator_updates > 0 else 0.0
         else:
             # If no batches processed, use zeros (shouldn't happen but handle gracefully)
@@ -695,9 +813,31 @@ def train_dapn_full_obs_encoder(
                     tgt_mean = last_target_features.mean().item()
                     src_std = last_source_features.std().item()
                     tgt_std = last_target_features.std().item()
-                    feature_stats = f" | Features: Src(μ={src_mean:.3f},σ={src_std:.3f}) Tgt(μ={tgt_mean:.3f},σ={tgt_std:.3f})"
+                    mean_diff = abs(src_mean - tgt_mean)
+                    feature_stats = f" | FeatDiff={mean_diff:.4f}"
                 
-                msg = f"Epoch {epoch+1}/{num_epochs}: Loss={avg_encoder_loss:.4f}, Adv={avg_adversarial_loss:.4f}, Disc={avg_discriminator_loss:.4f}, Acc={avg_disc_acc*100:.2f}%{feature_stats}"
+                # Add gradient norm info if available
+                grad_info = ""
+                if num_batches > 0:
+                    try:
+                        encoder_grad_norm = 0.0
+                        disc_grad_norm = 0.0
+                        for p in encoder_params:
+                            if p.grad is not None:
+                                encoder_grad_norm += p.grad.data.norm(2).item() ** 2
+                        encoder_grad_norm = encoder_grad_norm ** 0.5
+                        
+                        if domain_adapter is not None:
+                            for p in domain_adapter.parameters():
+                                if p.grad is not None:
+                                    disc_grad_norm += p.grad.data.norm(2).item() ** 2
+                            disc_grad_norm = disc_grad_norm ** 0.5
+                        
+                        grad_info = f" | Grads: Enc={encoder_grad_norm:.3f}, Disc={disc_grad_norm:.3f}"
+                    except:
+                        pass
+                
+                msg = f"Epoch {epoch+1}/{num_epochs}: Loss={avg_encoder_loss:.4f}, Adv={avg_adversarial_loss:.4f}, Disc={avg_discriminator_loss:.4f}, Acc={avg_disc_acc*100:.2f}%{feature_stats}{grad_info}"
             print(msg, flush=True)
             sys.stdout.flush()  # Force flush to ensure output appears
     
