@@ -1,15 +1,13 @@
-# RL Transfer Learning: Cyberwheel → CyberBattleSim
+RL Transfer Learning: Cyberwheel → CyberBattleSim
 
 **CyberBattleSim** using DAPN for domain adaptation.
-
 ## Prerequisites
 
 - **Python 3.10**
 - **Poetry** (>= 1.5)
 - **Graphviz**
 
-## Setup Project
-
+Setup Project
 ```bash
 # Navigate to project directory
 cd /home/ssaika/rl-transfer-sec-clean
@@ -61,21 +59,7 @@ After running:
 - `artifacts/transfer_models/dapn_encoder.pt` - Trained encoder
 - `artifacts/policies/cw_ppo_dapn.zip` - Trained policy
 
-## View Encoder Training Results
 
-To see encoder training progress and results, run the training manually:
-
-```bash
-# Activate virtual environment
-source .venv/bin/activate
-
-# Set environment variables
-export PYTHONPATH=/home/ssaika/rl-transfer-sec-clean/cyberwheel:$PYTHONPATH
-export CW_ENV_YAML=credential_preference_scenario.yaml
-
-# Run encoder training with custom parameters
-python train_dapn_encoder.py --num-samples 1000 --epochs 50
-```
 
 ## Encoder full training (policy-based collection + episodic encoder)
 
@@ -102,4 +86,4 @@ python train_dapn_encoder_episodic.py \
   --label-mode situation_action
 ```
 
-Encoder is saved to `artifacts/transfer_models/dapn_encoder_episodic.pt`. Optional: add `--deterministic-policy` for greedy actions during collection.
+
