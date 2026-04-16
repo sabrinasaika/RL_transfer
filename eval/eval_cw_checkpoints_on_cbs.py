@@ -120,12 +120,16 @@ def infer_cyberwheel_config(ckpt_path: str) -> Tuple[int, tuple]:
 
 
 def evaluate_on_cbs(model_path: str, episodes: int = 10, use_cyberwheel_native: bool = False, 
-                    action_space_size: Optional[int] = None, obs_space_shape: Optional[tuple] = None) -> dict:
+                    action_space_size: Optional[int] = None, obs_space_shape: Optional[tuple] = None,
+                    encoder_path: Optional[str] = None) -> dict:
     """
     Load a Cyberwheel-trained policy and evaluate its jumpstart performance on CBS via transfer project.
     
     For Cyberwheel native checkpoints, uses Cyberwheel's RLPolicy evaluation interface
     through the transfer project's UnifiedSecEnv.
+    
+    Args:
+        encoder_path: Optional path to transfer encoder checkpoint. If provided, uses transfer learning.
     """
     os.environ.setdefault("CBS_MULTI_INPUT", "0")
     os.environ.setdefault("CBS_REPAIR", "1")
@@ -133,6 +137,11 @@ def evaluate_on_cbs(model_path: str, episodes: int = 10, use_cyberwheel_native: 
     os.environ.setdefault("EVAL_MASK_POLICY", "0")
 
     env = UnifiedSecEnv("cbs", cbs_factory=make_cbs_env)
+    
+    # Enable transfer learning if encoder path provided
+    if encoder_path and os.path.exists(encoder_path):
+        env.obs_t = ObservationTranslator(use_transfer=True, encoder_path=encoder_path)
+        print(f"  Using transfer encoder from {encoder_path}")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     if use_cyberwheel_native:
@@ -178,7 +187,7 @@ def evaluate_on_cbs(model_path: str, episodes: int = 10, use_cyberwheel_native: 
         truncated = False
         ep_ret = 0.0
         step = 0
-        max_steps = int(os.environ.get("CBS_MAX_STEPS", "1000"))
+        max_steps = int(os.environ.get("CBS_MAX_STEPS", "5000"))
         
         while not (done or truncated) and step < max_steps:
             if use_cyberwheel_native:
@@ -295,7 +304,7 @@ def evaluate_random_baseline_on_cbs(episodes: int = 10) -> dict:
     returns: List[float] = []
     steps_to_goal: List[int] = []
     successes: int = 0
-    max_steps = int(os.environ.get("CBS_MAX_STEPS", "1000"))
+    max_steps = int(os.environ.get("CBS_MAX_STEPS", "5000"))
     for _ in range(episodes):
         obs, info = env.reset()
         done = False
@@ -388,6 +397,7 @@ def plot_side_by_side(tb_dir: str,
         try:
             ea = EventAccumulator(tb_dir)
             ea.Reload()
+            s_values = []  # Initialize to track if we have negative values
             # Training reward (Cyberwheel uses charts/red_episodic_return)
             if 'charts/red_episodic_return' in ea.Tags().get('scalars', []):
                 s = ea.Scalars('charts/red_episodic_return')
@@ -417,10 +427,15 @@ def plot_side_by_side(tb_dir: str,
                 axes[0].plot([e.step for e in s], [e.value for e in s], label='Eval Reward', linewidth=2)
             axes[0].set_title('Cyberwheel Training Performance', fontsize=14, fontweight='bold')
             axes[0].set_xlabel('Timesteps')
-            axes[0].set_ylabel('Reward')
+            axes[0].set_ylabel('Episodic Return (can be negative)', fontsize=11)
             axes[0].grid(True, alpha=0.3)
             axes[0].legend()
             axes[0].axhline(y=0, color='black', linestyle='--', alpha=0.4)
+            # Add note about negative rewards being expected
+            if s_values and min(s_values) < 0:
+                axes[0].text(0.02, 0.98, 'Note: Negative returns are expected\n(penalty for failed actions)', 
+                           transform=axes[0].transAxes, fontsize=9, verticalalignment='top',
+                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         except Exception as e:
             axes[0].text(0.5, 0.5, f"TB load failed: {e}", ha='center', va='center')
             axes[0].set_axis_off()
@@ -465,9 +480,10 @@ def plot_side_by_side(tb_dir: str,
 def main():
     # Support both SB3 and Cyberwheel native checkpoints
     ckpt_dir = os.environ.get("CW_CKPT_DIR", "/home/ssaika/rl-transfer-sec-clean/cyberwheel/cyberwheel/data/models/CWRun_Long")
-    episodes = int(os.environ.get("CBS_EVAL_EPISODES", "5"))
+    episodes = int(os.environ.get("CBS_EVAL_EPISODES", "10"))
     tb_dir = os.environ.get("CW_TB_DIR", "/home/ssaika/rl-transfer-sec-clean/cyberwheel/cyberwheel/data/runs/CWRun_Long")
     out_dir = os.environ.get("OUT_DIR", "/home/ssaika/rl-transfer-sec-clean/artifacts/plots/transfer_eval")
+    encoder_path = os.environ.get("TRANSFER_ENCODER_PATH", None)  # Optional transfer encoder
     os.makedirs(out_dir, exist_ok=True)
 
     checkpoints = find_checkpoints(ckpt_dir)

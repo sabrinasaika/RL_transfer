@@ -48,7 +48,12 @@ class DAPNUnifiedFullObsTranslator:
         
         # Create preprocessor to convert both domains to fixed-size vectors
         self.preprocessor = UnifiedFullObsPreprocessor(unified_dim=unified_dim)
-        
+
+        # Normalization stats (loaded from checkpoint; None = fallback /100 clipping)
+        self.norm_mean: Optional[np.ndarray] = None
+        self.norm_std:  Optional[np.ndarray] = None
+        self.clip_z: float = 5.0
+
         # Create SINGLE shared encoder (follows DAPN master concept)
         self.shared_encoder = None
         self.domain_adapter = None
@@ -80,7 +85,7 @@ class DAPNUnifiedFullObsTranslator:
     def load_encoder(self, encoder_path: str):
         """Load encoder weights from checkpoint."""
         try:
-            checkpoint = torch.load(encoder_path, map_location=self.device)
+            checkpoint = torch.load(encoder_path, map_location=self.device, weights_only=False)
             
             if 'shared_encoder_state_dict' in checkpoint:
                 self.shared_encoder.load_state_dict(checkpoint['shared_encoder_state_dict'])
@@ -94,9 +99,17 @@ class DAPNUnifiedFullObsTranslator:
             
             if 'unified_dim' in checkpoint:
                 self.unified_dim = checkpoint['unified_dim']
-                # Recreate preprocessor with correct dimension
                 self.preprocessor = UnifiedFullObsPreprocessor(unified_dim=self.unified_dim)
-            
+
+            # Load z-score normalization stats saved by train_dapn_encoder.py
+            if 'norm_mean' in checkpoint and 'norm_std' in checkpoint:
+                self.norm_mean = np.asarray(checkpoint['norm_mean'], dtype=np.float32)
+                self.norm_std  = np.asarray(checkpoint['norm_std'],  dtype=np.float32)
+                self.clip_z    = float(checkpoint.get('clip_z', 5.0))
+                print(f"  Loaded z-score norm stats (mean/std shape={self.norm_mean.shape})")
+            else:
+                print(f"  Warning: no norm stats in checkpoint — using /100 fallback")
+
             print(f"Loaded unified full observation DAPN encoder from {encoder_path}")
         except Exception as e:
             print(f"Warning: Could not load encoder from {encoder_path}: {e}")
@@ -127,19 +140,17 @@ class DAPNUnifiedFullObsTranslator:
         
         # Step 1: Preprocess full CBS dict to fixed-size vector
         unified_vec = self.preprocessor.preprocess_cbs(obs)
-        
-        # Step 2: Normalize to [0, 1] range
-        # Use max values for normalization (can be learned or set empirically)
-        max_vals = np.ones(self.unified_dim, dtype=np.float32) * 100.0  # Conservative normalization
-        normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-        
+
+        # Step 2: Normalize — z-score if stats available, else /100 fallback
+        normalized = self._normalize(unified_vec)
+
         # Step 3: Encode using single shared encoder
         with torch.no_grad():
             obs_tensor = torch.from_numpy(normalized).float().to(self.device)
             features = self.shared_encoder(obs_tensor)
             if isinstance(features, torch.Tensor):
                 features = features.cpu().numpy()
-        
+
         return features.astype(np.float32)
     
     def from_cw(self, obs_vec: np.ndarray) -> np.ndarray:
@@ -157,16 +168,24 @@ class DAPNUnifiedFullObsTranslator:
         
         # Step 1: Preprocess full Cyberwheel array to fixed-size vector
         unified_vec = self.preprocessor.preprocess_cw(obs_vec)
-        
-        # Step 2: Normalize to [0, 1] range
-        max_vals = np.ones(self.unified_dim, dtype=np.float32) * 100.0
-        normalized = np.clip(unified_vec / max_vals, 0.0, 1.0)
-        
+
+        # Step 2: Normalize — z-score if stats available, else /100 fallback
+        normalized = self._normalize(unified_vec)
+
         # Step 3: Encode using single shared encoder
         with torch.no_grad():
             obs_tensor = torch.from_numpy(normalized).float().to(self.device)
             features = self.shared_encoder(obs_tensor)
             if isinstance(features, torch.Tensor):
                 features = features.cpu().numpy()
-        
+
         return features.astype(np.float32)
+
+    def _normalize(self, vec: np.ndarray) -> np.ndarray:
+        """Z-score normalize if stats loaded, else clip to [0,1] with /100 fallback."""
+        vec = np.asarray(vec, dtype=np.float32)
+        if self.norm_mean is not None and self.norm_std is not None:
+            z = (vec - self.norm_mean) / self.norm_std
+            return np.clip(z, -self.clip_z, self.clip_z).astype(np.float32)
+        max_vals = np.ones(self.unified_dim, dtype=np.float32) * 100.0
+        return np.clip(vec / max_vals, 0.0, 1.0).astype(np.float32)

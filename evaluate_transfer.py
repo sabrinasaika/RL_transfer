@@ -107,6 +107,9 @@ def evaluate_transfer_cw_to_cbs(
         done = False
         truncated = False
         
+        # Track cumulative reward at 10-step intervals
+        interval_rewards = []
+        
         # Handle dict observations from DAPN wrapper
         while not (done or truncated) and steps < 100:
             # Extract observation based on what model expects
@@ -123,10 +126,16 @@ def evaluate_transfer_cw_to_cbs(
                 obs_for_pred = obs
             
             try:
-                action, _ = model.predict(obs_for_pred, deterministic=True)
+                # Use stochastic actions to see if agent learned anything useful
+                # Deterministic=True causes the agent to always pick the same (often invalid) action
+                action, _ = model.predict(obs_for_pred, deterministic=False)
                 obs, reward, done, truncated, info = target_env.step(action)
                 total_reward += reward
                 steps += 1
+                
+                # Record cumulative reward at 10-step intervals
+                if steps % 10 == 0 or done or truncated:
+                    interval_rewards.append((steps, total_reward))
             except Exception as e:
                 print(f"\n   ✗ Error during prediction: {e}")
                 print(f"   Observation shape: {obs_for_pred.shape if hasattr(obs_for_pred, 'shape') else type(obs_for_pred)}")
@@ -135,7 +144,15 @@ def evaluate_transfer_cw_to_cbs(
         
         episode_rewards.append(total_reward)
         episode_lengths.append(steps)
-        print(f"   Episode {episode+1}: Reward={total_reward:.2f}, Steps={steps}")
+        
+        # Print episode results with 10-step intervals
+        print(f"\n   Episode {episode+1}:")
+        print(f"      Total reward: {total_reward:.2f}, Steps: {steps}")
+        print(f"      Reward per 10 steps:")
+        for step, cum_reward in interval_rewards:
+            print(f"         Step {step:3d}: cumulative reward = {cum_reward:6.2f}")
+        if not interval_rewards:
+            print(f"         (Episode ended before first 10-step interval)")
     
     # Statistics
     avg_reward = sum(episode_rewards) / len(episode_rewards)
@@ -162,59 +179,255 @@ def evaluate_transfer_cw_to_cbs(
     }
 
 
+def run_cw_no_encoder_baseline_cbs(
+    model_path: str,
+    num_episodes: int = 5,
+    max_steps: int = 100,
+    seed: int = None,
+):
+    """
+    Run a CW policy trained WITHOUT the DAPN encoder on CBS (no encoder at test time).
+    Uses UnifiedSecEnv for CBS so the policy gets 8D unified obs, matching what it saw during training on CW.
+    Same env config as transfer eval. Returns same stats shape as evaluate_transfer_cw_to_cbs.
+    """
+    if seed is not None:
+        import numpy as np
+        np.random.seed(seed)
+    os.environ["CBS_ENV"] = "CyberBattleFlat-v0"
+    os.environ["CBS_FLAT_NODES"] = "20"
+    os.environ["CBS_CRED_REUSE_PROB"] = "0.6"
+    os.environ["CBS_EXPLOIT_PROB"] = "0.3"
+    base_env = UnifiedSecEnv("cbs", cbs_factory=make_cbs_env)
+    model = PPO.load(model_path)
+    episode_rewards = []
+    episode_lengths = []
+    for episode in range(num_episodes):
+        obs, _ = base_env.reset()
+        total_reward = 0
+        steps = 0
+        done = False
+        truncated = False
+        while not (done or truncated) and steps < max_steps:
+            obs_for_pred = obs["obs"] if isinstance(obs, dict) else obs
+            action, _ = model.predict(obs_for_pred, deterministic=False)
+            obs, reward, done, truncated, info = base_env.step(action)
+            total_reward += reward
+            steps += 1
+        episode_rewards.append(total_reward)
+        episode_lengths.append(steps)
+        print(f"   CW (no encoder) episode {episode + 1}/{num_episodes}: reward={total_reward:.0f}, steps={steps}")
+    avg_reward = sum(episode_rewards) / len(episode_rewards)
+    avg_length = sum(episode_lengths) / len(episode_lengths)
+    max_reward = max(episode_rewards)
+    return {
+        "avg_reward": avg_reward,
+        "max_reward": max_reward,
+        "avg_length": avg_length,
+        "episode_rewards": episode_rewards,
+    }
+
+
+def run_random_baseline_cbs(num_episodes=5, max_steps=100, seed=None):
+    """
+    Run a random policy on CBS (no encoder, no trained policy).
+    Same env config as transfer eval so comparison is fair.
+    Returns same stats as evaluate_transfer_cw_to_cbs.
+    """
+    if seed is not None:
+        import numpy as np
+        np.random.seed(seed)
+    os.environ["CBS_ENV"] = "CyberBattleFlat-v0"
+    os.environ["CBS_FLAT_NODES"] = "20"
+    os.environ["CBS_CRED_REUSE_PROB"] = "0.6"
+    os.environ["CBS_EXPLOIT_PROB"] = "0.3"
+    base_env = UnifiedSecEnv("cbs", cbs_factory=make_cbs_env)
+    episode_rewards = []
+    episode_lengths = []
+    for episode in range(num_episodes):
+        obs, _ = base_env.reset()
+        total_reward = 0
+        steps = 0
+        done = False
+        truncated = False
+        while not (done or truncated) and steps < max_steps:
+            action = base_env.action_space.sample()
+            obs, reward, done, truncated, info = base_env.step(action)
+            total_reward += reward
+            steps += 1
+        episode_rewards.append(total_reward)
+        episode_lengths.append(steps)
+        print(f"   Baseline episode {episode + 1}/{num_episodes}: reward={total_reward:.0f}, steps={steps}")
+    avg_reward = sum(episode_rewards) / len(episode_rewards)
+    avg_length = sum(episode_lengths) / len(episode_lengths)
+    max_reward = max(episode_rewards)
+    return {
+        "avg_reward": avg_reward,
+        "max_reward": max_reward,
+        "avg_length": avg_length,
+        "episode_rewards": episode_rewards,
+    }
+
+
 def main():
-    """Run transfer learning evaluation"""
+    """Run transfer learning evaluation (reward/success on CBS = real transfer metric)."""
+    import argparse
+    parser = argparse.ArgumentParser(
+        description="Evaluate CW→CBS transfer: run a Cyberwheel policy on CyberBattleSim with DAPN encoder. Reports average reward (real transfer metric)."
+    )
+    parser.add_argument("--encoder", type=str, default=None,
+                        help="Path to DAPN encoder .pt (e.g. artifacts/transfer_models/dapn_encoder_episodic.pt)")
+    parser.add_argument("--model", type=str, default=None,
+                        help="Path to CW policy .zip (must be trained with DAPN if using encoder)")
+    parser.add_argument("--num-episodes", type=int, default=5, help="Number of evaluation episodes")
+    parser.add_argument("--no-baseline", action="store_true", help="Skip random-policy baseline (faster)")
+    parser.add_argument("--baseline-model", type=str, default=None,
+                        help="Path to CW policy trained WITHOUT encoder (e.g. cw_ppo_very_short.zip). If set, run on CBS without encoder and show episode-by-episode comparison.")
+    args = parser.parse_args()
+
     print("\n" + "=" * 60)
     print("TRANSFER LEARNING: Cyberwheel → CyberBattleSim")
     print("=" * 60)
-    print("\nThis tests if a model trained on Cyberwheel can work on CyberBattleSim")
-    print("using DAPN for domain adaptation.\n")
-    
-    # Check for models - prefer DAPN-trained model
-    cw_model = "artifacts/policies/cw_ppo_dapn.zip"
+    print("Metric: average reward on CBS (real transfer), not synthetic-label accuracy.\n")
+
+    # Encoder path: CLI > episodic default > legacy default
+    dapn_encoder = args.encoder
+    if dapn_encoder is None:
+        dapn_encoder = "artifacts/transfer_models/dapn_encoder_episodic.pt"
+        if not os.path.exists(dapn_encoder):
+            dapn_encoder = "artifacts/transfer_models/dapn_encoder.pt"
+
+    # Policy: must be trained with DAPN to match encoder observation space (e.g. 256-d)
+    cw_model = args.model
     use_dapn_trained = True
-    if not os.path.exists(cw_model):
-        print("DAPN-trained model not found. Looking for regular model...")
-        cw_model = "artifacts/policies/cw_ppo_very_short.zip"
+    if cw_model is None:
+        cw_model = "artifacts/policies/cw_ppo_dapn.zip"
         if not os.path.exists(cw_model):
-            cw_model = "artifacts/policies/cw_ppo_minimal.zip"
-        use_dapn_trained = False
-        print("  Using model trained WITHOUT DAPN")
-        print("  This model expects 8D observations, but DAPN produces 256D")
-        print("  Transfer learning will likely fail!")
-        print("\n  To fix: Train model WITH DAPN first:")
-        print("    1. Train DAPN encoder: python train_dapn_encoder.py --num-samples 1000 --epochs 50")
-        print("    2. Train model with DAPN: python train/train_cw_ppo_with_dapn.py")
-    
-    dapn_encoder = "artifacts/transfer_models/dapn_encoder.pt"
-    
+            cw_model = "artifacts/policies/cw_ppo_very_short.zip"
+            if not os.path.exists(cw_model):
+                cw_model = "artifacts/policies/cw_ppo_minimal.zip"
+            use_dapn_trained = False
+            print("DAPN-trained policy not found. Using policy trained without DAPN.")
+            print("  Observation space may mismatch (8D vs 256D). For proper evaluation:")
+            print("  Train CW policy with DAPN: python train/train_cw_ppo_with_dapn.py")
+            print("  Then: python evaluate_transfer.py --encoder <your_encoder.pt> --model <cw_ppo_dapn.zip>")
+
     if not os.path.exists(cw_model):
-        print("Cyberwheel model not found. Train it first:")
-        print("  python train/train_cw_ppo_very_short.py")
+        print("Policy not found:", cw_model)
+        print("  Train a CW policy first, e.g. python train/train_cw_ppo_very_short.py")
+        print("  For transfer, train with DAPN: python train/train_cw_ppo_with_dapn.py")
         return
-    
+
     if not os.path.exists(dapn_encoder):
-        if use_dapn_trained:
-            print("DAPN encoder not found. Train it first:")
-            print("  python train_dapn_encoder.py --num-samples 1000 --epochs 50")
-            print("\n  Or run without DAPN (may not work as well):")
-            use_dapn = False
-        else:
-            print("DAPN encoder not found, but model wasn't trained with DAPN anyway.")
-            print("  Transfer learning requires BOTH:")
-            print("    1. Model trained WITH DAPN")
-            print("    2. DAPN encoder for adaptation")
-            use_dapn = False
+        print("Encoder not found:", dapn_encoder)
+        print("  Train encoder first: python train_dapn_encoder_episodic.py")
+        print("  Then: python evaluate_transfer.py --encoder artifacts/transfer_models/dapn_encoder_episodic.pt")
+        use_dapn = False
     else:
         use_dapn = True
-    
-    # Run transfer evaluation
-    evaluate_transfer_cw_to_cbs(
+        print("Encoder:", dapn_encoder)
+    print("Policy:", cw_model)
+    print("Episodes:", args.num_episodes)
+
+    # 1) Transfer: CW policy + DAPN encoder on CBS
+    transfer_results = evaluate_transfer_cw_to_cbs(
         source_model_path=cw_model,
-        dapn_encoder_path=dapn_encoder,
-        num_episodes=5,
+        dapn_encoder_path=dapn_encoder if use_dapn else "",
+        num_episodes=args.num_episodes,
         use_dapn=use_dapn
     )
+
+    # 2) Baseline: random policy on CBS (same env, no encoder)
+    baseline_results = None
+    if not args.no_baseline and transfer_results is not None:
+        import numpy as np
+        print("\n" + "=" * 60)
+        print("BASELINE: Random policy on CBS (same env, no encoder)")
+        print("=" * 60)
+        try:
+            baseline_results = run_random_baseline_cbs(
+                num_episodes=args.num_episodes,
+                max_steps=100,
+                seed=42,
+            )
+            print(f"   Average reward: {baseline_results['avg_reward']:.2f}")
+            print(f"   Max reward: {baseline_results['max_reward']:.2f}")
+            print(f"   Average episode length: {baseline_results['avg_length']:.1f} steps")
+        except Exception as e:
+            print(f"   Baseline failed: {e}")
+            import traceback
+            traceback.print_exc()
+        print("=" * 60)
+
+    # 2b) Baseline: CW policy trained WITHOUT encoder, run on CBS (no encoder)
+    cw_no_encoder_results = None
+    baseline_model = args.baseline_model
+    if baseline_model is None:
+        baseline_model = "artifacts/policies/cw_ppo_very_short.zip"
+        if not os.path.exists(baseline_model):
+            baseline_model = "artifacts/policies/cw_ppo_minimal.zip"
+    if transfer_results is not None and os.path.exists(baseline_model):
+        print("\n" + "=" * 60)
+        print("BASELINE: CW policy (trained WITHOUT encoder) on CBS (no encoder)")
+        print("=" * 60)
+        print(f"   Model: {baseline_model}")
+        try:
+            cw_no_encoder_results = run_cw_no_encoder_baseline_cbs(
+                model_path=baseline_model,
+                num_episodes=args.num_episodes,
+                max_steps=100,
+                seed=42,
+            )
+            print(f"   Average reward: {cw_no_encoder_results['avg_reward']:.2f}")
+            print(f"   Max reward: {cw_no_encoder_results['max_reward']:.2f}")
+        except Exception as e:
+            print(f"   CW no-encoder baseline failed: {e}")
+            import traceback
+            traceback.print_exc()
+        print("=" * 60)
+
+    # 3) Episode-by-episode comparison and summary
+    n_ep = args.num_episodes
+    if transfer_results is not None:
+        t_rew = transfer_results["episode_rewards"]
+        print("\n" + "=" * 60)
+        print("EPISODE-BY-EPISODE COMPARISON (reward per episode)")
+        print("=" * 60)
+        print(f"   {'Episode':<10} {'Transfer (CW+DAPN on CBS)':<28} {'CW no encoder (on CBS)':<24} {'Random (CBS)':<14}")
+        print("   " + "-" * 76)
+        for ep in range(n_ep):
+            tr = t_rew[ep] if ep < len(t_rew) else float("nan")
+            cw_no = cw_no_encoder_results["episode_rewards"][ep] if cw_no_encoder_results and ep < len(cw_no_encoder_results["episode_rewards"]) else None
+            rnd = baseline_results["episode_rewards"][ep] if baseline_results and ep < len(baseline_results["episode_rewards"]) else None
+            cw_str = f"{cw_no:.2f}" if cw_no is not None else "—"
+            rnd_str = f"{rnd:.2f}" if rnd is not None else "—"
+            print(f"   {ep + 1:<10} {tr:<28.2f} {cw_str:<24} {rnd_str:<14}")
+        print("   " + "-" * 76)
+        t_avg = transfer_results["avg_reward"]
+        cw_no_avg = cw_no_encoder_results["avg_reward"] if cw_no_encoder_results else None
+        b_avg = baseline_results["avg_reward"] if baseline_results else None
+        cw_avg_str = f"{cw_no_avg:.2f}" if cw_no_avg is not None else "—"
+        b_avg_str = f"{b_avg:.2f}" if b_avg is not None else "—"
+        print(f"   {'Average':<10} {t_avg:<28.2f} {cw_avg_str:<24} {b_avg_str:<14}")
+        print("=" * 60)
+
+    if transfer_results is not None and baseline_results is not None:
+        t_avg = transfer_results["avg_reward"]
+        b_avg = baseline_results["avg_reward"]
+        diff = t_avg - b_avg
+        pct = (100.0 * (t_avg - b_avg) / b_avg) if b_avg != 0 else (100.0 if t_avg > 0 else 0.0)
+        print("\nCOMPARISON (Transfer vs Random baseline):")
+        print(f"   Transfer avg reward:  {t_avg:.2f}")
+        print(f"   Random avg reward:   {b_avg:.2f}")
+        print(f"   Difference:          {diff:+.2f} ({pct:+.1f}%)")
+        if cw_no_encoder_results is not None:
+            c_avg = cw_no_encoder_results["avg_reward"]
+            print(f"   CW no-encoder avg:   {c_avg:.2f}")
+            print(f"   Transfer vs CW no-enc: {t_avg - c_avg:+.2f}")
+        if diff > 0:
+            print("   => Transfer policy outperforms random baseline.")
+        else:
+            print("   => Transfer policy does not outperform random baseline on this run.")
+        print("=" * 60)
 
 
 if __name__ == "__main__":

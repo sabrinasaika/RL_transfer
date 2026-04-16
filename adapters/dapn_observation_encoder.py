@@ -48,17 +48,18 @@ class DAPNObservationEncoder(nn.Module):
         
         # Feature extraction layers (similar to ResNet feature layers)
         # Since we have vector inputs, we use MLPs instead of conv layers
+        # REMOVED BatchNorm to prevent feature collapse - using LayerNorm instead
         self.feature_layers = nn.Sequential(
             nn.Linear(input_dim, 128),
-            nn.BatchNorm1d(128),
+            nn.LayerNorm(128),  # LayerNorm instead of BatchNorm (works with any batch size)
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),  # Reduced dropout
             nn.Linear(128, 256),
-            nn.BatchNorm1d(256),
+            nn.LayerNorm(256),
             nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
+            nn.Dropout(0.1),
             nn.Linear(256, 512),
-            nn.BatchNorm1d(512),
+            nn.LayerNorm(512),
             nn.ReLU(inplace=True),
         )
         
@@ -70,6 +71,24 @@ class DAPNObservationEncoder(nn.Module):
         else:
             self.__in_features = 512
         
+        # Attention module to suppress domain-specific information
+        # Produces a gating vector in [0, 1] for each feature dimension
+        self.attention = nn.Sequential(
+            nn.Linear(self.__in_features, self.__in_features),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.__in_features, self.__in_features),
+            nn.Sigmoid()
+        )
+        
+        # Autoencoder decoder to reconstruct input from embedded features
+        # Helps preserve semantic information while suppressing domain-specific noise
+        decoder_hidden = max(128, self.__in_features)
+        self.decoder = nn.Sequential(
+            nn.Linear(self.__in_features, decoder_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(decoder_hidden, input_dim)
+        )
+        
         # Initialize weights
         self.apply(self._init_weights)
     
@@ -77,19 +96,21 @@ class DAPNObservationEncoder(nn.Module):
         """Initialize weights similar to DAPN's initialization."""
         classname = m.__class__.__name__
         if classname.find('Linear') != -1:
-            nn.init.xavier_normal_(m.weight)
+            # Use kaiming init for ReLU (better than xavier for ReLU)
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-        elif classname.find('BatchNorm') != -1:
-            nn.init.normal_(m.weight, 1.0, 0.02)
+        elif classname.find('LayerNorm') != -1:
+            nn.init.ones_(m.weight)
             nn.init.zeros_(m.bias)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_all: bool = False):
         """
         Forward pass through the encoder.
         
         Args:
             x: Input observation tensor of shape (batch_size, input_dim) or (input_dim,)
+            return_all: If True, return (embedded, pre_embed, recon, attention)
         
         Returns:
             features: Encoded features of shape (batch_size, feature_size) or (feature_size,)
@@ -98,30 +119,28 @@ class DAPNObservationEncoder(nn.Module):
         if was_1d:
             x = x.unsqueeze(0)
         
-        # Handle batch size 1 for BatchNorm (set to eval mode temporarily)
-        batch_size = x.size(0)
-        if batch_size == 1 and self.training:
-            # Set BatchNorm layers to eval mode for single sample
-            for module in self.feature_layers:
-                if isinstance(module, nn.BatchNorm1d):
-                    module.eval()
-        
-        # Extract features
-        features = self.feature_layers(x)
-        
-        # Restore training mode if we changed it
-        if batch_size == 1 and self.training:
-            for module in self.feature_layers:
-                if isinstance(module, nn.BatchNorm1d):
-                    module.train()
+        # Extract features (LayerNorm works with any batch size, no special handling needed)
+        pre_features = self.feature_layers(x)
         
         # Apply bottleneck if enabled
         if self.use_bottleneck:
-            features = self.bottleneck(features)
+            pre_features = self.bottleneck(pre_features)
+        
+        # Apply attention gating
+        attention = self.attention(pre_features)
+        features = pre_features * attention
+        
+        # Autoencoder reconstruction (from embedded features)
+        recon = self.decoder(features)
         
         if was_1d:
             features = features.squeeze(0)
+            pre_features = pre_features.squeeze(0)
+            recon = recon.squeeze(0)
+            attention = attention.squeeze(0)
         
+        if return_all:
+            return features, pre_features, recon, attention
         return features
     
     def output_num(self):
@@ -153,9 +172,21 @@ class DAPNDomainAdapter(nn.Module):
             nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(0.5),
-            nn.Linear(hidden_size, 1),
-            nn.Sigmoid()
+            nn.Linear(hidden_size, 1)
+            # No Sigmoid here — BCEWithLogitsLoss expects raw logits
         )
+        
+        # Initialize weights properly to prevent saturation
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize discriminator weights to prevent saturation."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Use smaller initialization to prevent saturation
+                nn.init.xavier_uniform_(m.weight, gain=0.1)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
     
     def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
@@ -174,6 +205,9 @@ class DAPNObservationTranslator:
     """
     Observation translator using DAPN for domain adaptation.
     Can be used as a drop-in replacement for ObservationTranslator.
+    
+    NOTE: This class is for 8D observations only (legacy approach).
+    For full observations, use DAPNUnifiedFullObsTranslator instead.
     """
     
     def __init__(
@@ -192,9 +226,12 @@ class DAPNObservationTranslator:
             use_dapn: Whether to use DAPN encoder
             encoder_path: Path to saved encoder checkpoint
             feature_size: Size of feature space
-            input_dim: Input observation dimension
+            input_dim: Input observation dimension (should be 8 for this legacy class)
             device: Device to run on
             use_adversarial: Whether to use adversarial domain adaptation (for training)
+        
+        NOTE: This translator converts observations to 8D vectors first.
+        For full observation support, use DAPNUnifiedFullObsTranslator.
         """
         self.use_dapn = use_dapn
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -202,7 +239,8 @@ class DAPNObservationTranslator:
         self.input_dim = input_dim
         self.use_adversarial = use_adversarial
         
-        # Default scales for normalization (same as ObservationTranslator)
+        # Default scales for normalization (8D-specific: [discovered_nodes, compromised_hosts, 
+        # discovered_hosts, known_vulns, creds, steps_elapsed, dist_goal, alerts])
         self.default_scales = np.array([50, 50, 50, 200, 50, 1000, 20.0, 100], dtype=np.float32)
         
         # Create encoder(s) for domain adaptation
@@ -263,7 +301,7 @@ class DAPNObservationTranslator:
     def load_encoder(self, encoder_path: str):
         """Load encoder weights from checkpoint."""
         try:
-            checkpoint = torch.load(encoder_path, map_location=self.device)
+            checkpoint = torch.load(encoder_path, map_location=self.device, weights_only=False)
             
             if self.use_shared_encoder:
                 # Load shared encoder
@@ -400,8 +438,11 @@ class DAPNObservationTranslator:
             except Exception:
                 steps_elapsed = 0
         
-        dist_goal = 0.0
-        
+        if discovered_node_count > 0:
+            dist_goal = (1.0 - compromised_hosts / float(discovered_node_count)) * self.default_scales[6]
+        else:
+            dist_goal = float(self.default_scales[6])
+
         probe_result = int(obs.get("probe_result", 0) or 0 if isinstance(obs, dict) else 0)
         escalation_val = int(obs.get("escalation", 0) or 0 if isinstance(obs, dict) else 0)
         alerts = int((probe_result == 1)) + int(escalation_val > 0)
@@ -472,7 +513,7 @@ class DAPNObservationTranslator:
         return np.array([
             discovered_hosts,
             compromised_hosts,
-            discovered_hosts,
+            total_hosts_present,
             known_vulns,
             credentials_found,
             steps_elapsed,

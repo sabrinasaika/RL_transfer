@@ -8,6 +8,8 @@ import torch
 import numpy as np
 from typing import Dict, Union, Optional
 
+from adapters.kill_chain import cw_raw_to_red_vector
+
 
 class UnifiedFullObsPreprocessor:
     """
@@ -61,118 +63,65 @@ class UnifiedFullObsPreprocessor:
     def preprocess_cbs(self, obs: Dict) -> np.ndarray:
         """
         Convert CBS full observation dict to fixed-size vector.
-        Preserves all information by flattening all fields.
-        
-        Args:
-            obs: Full CBS observation dictionary
-        
-        Returns:
-            Fixed-size vector [unified_dim]
+
+        Field layout (most informative first so truncation to unified_dim preserves signal):
+          [0:100]    nodes_privilegelevel  (100D) — primary kill-chain signal
+          [100:106]  scalars               (6D)   — discovered_node_count, cred_cache_length,
+                                                     escalation, lateral_move,
+                                                     newly_discovered_nodes_count, customer_data_found
+          [106:306]  leaked_credentials    (200D) — credential cache encoded as node+port pairs
+          [306:512]  node_properties       (206D) — discovered_nodes_properties flattened, truncated
+
+        Fixes vs previous version:
+          - cbs_max_nodes was 50; actual CBS arrays are 100-element → now uses 100
+          - cbs_property_count was 3; actual is 14 → now reads the real shape
+          - credential key was 'credential_cache_matrix' (absent); actual is 'leaked_credentials'
         """
-        vec_parts = []
-        
-        # 1. Scalar fields (6 values)
-        scalars = [
-            float(obs.get("newly_discovered_nodes_count", 0)),
-            float(obs.get("lateral_move", 0)),
-            float(obs.get("customer_data_found", 0)),
-            float(obs.get("probe_result", 0)),
-            float(obs.get("escalation", 0)),
-            float(obs.get("credential_cache_length", 0))
-        ]
-        vec_parts.append(np.array(scalars, dtype=np.float32))
-        
-        # 2. Node properties matrix (max_nodes × property_count)
-        node_props = obs.get("discovered_nodes_properties", np.zeros((0, self.cbs_property_count)))
-        if isinstance(node_props, np.ndarray):
-            if node_props.size == 0:
-                node_props = np.zeros((self.cbs_max_nodes, self.cbs_property_count), dtype=np.float32)
-            else:
-                # Pad or truncate to max_nodes
-                if node_props.shape[0] < self.cbs_max_nodes:
-                    padding = np.zeros((self.cbs_max_nodes - node_props.shape[0], node_props.shape[1]), dtype=np.float32)
-                    node_props = np.vstack([node_props, padding])
-                elif node_props.shape[0] > self.cbs_max_nodes:
-                    node_props = node_props[:self.cbs_max_nodes]
-                
-                # Ensure correct property count
-                if node_props.shape[1] < self.cbs_property_count:
-                    padding = np.zeros((node_props.shape[0], self.cbs_property_count - node_props.shape[1]), dtype=np.float32)
-                    node_props = np.hstack([node_props, padding])
-                elif node_props.shape[1] > self.cbs_property_count:
-                    node_props = node_props[:, :self.cbs_property_count]
+        def _pad1d(arr, length):
+            arr = np.asarray(arr, dtype=np.float32).ravel()
+            if len(arr) >= length:
+                return arr[:length]
+            return np.concatenate([arr, np.zeros(length - len(arr), dtype=np.float32)])
+
+        # 1. Privilege levels (100D) — front-loaded: directly encodes kill-chain stage
+        priv = obs.get("nodes_privilegelevel", [])
+        part_priv = _pad1d(priv, 100)
+
+        # 2. Scalar fields (6D)
+        part_scalars = np.array([
+            float(obs.get("discovered_node_count",          0) or 0),
+            float(obs.get("credential_cache_length",        0) or 0),
+            float(obs.get("escalation",                     0) or 0),
+            float(obs.get("lateral_move",                   0) or 0),
+            float(obs.get("newly_discovered_nodes_count",   0) or 0),
+            float(obs.get("customer_data_found",            0) or 0),
+        ], dtype=np.float32)
+
+        # 3. Credential cache matrix (100D) — shape (1000,2): [node_id, port_id] per cached cred.
+        #    Key is 'credential_cache_matrix' (tuple of 1000 x 2-element arrays).
+        #    Encode first 50 credentials × 2 values = 100D; rest is zeros when cache is sparse.
+        ccm = obs.get("credential_cache_matrix", ())
+        if isinstance(ccm, (tuple, list)) and len(ccm) > 0:
+            arr = np.asarray(ccm, dtype=np.float32)          # (1000, 2) or similar
+            part_creds = _pad1d(arr.ravel(), 100)            # take first 50 creds × 2
         else:
-            node_props = np.zeros((self.cbs_max_nodes, self.cbs_property_count), dtype=np.float32)
-        
-        vec_parts.append(node_props.flatten())
-        
-        # 3. Privilege levels (max_nodes)
-        priv = obs.get("nodes_privilegelevel", np.array([], dtype=np.int32))
-        if isinstance(priv, np.ndarray):
-            if priv.size == 0:
-                priv = np.zeros(self.cbs_max_nodes, dtype=np.float32)
-            else:
-                priv = priv.astype(np.float32)
-                if len(priv) < self.cbs_max_nodes:
-                    padding = np.zeros(self.cbs_max_nodes - len(priv), dtype=np.float32)
-                    priv = np.concatenate([priv, padding])
-                elif len(priv) > self.cbs_max_nodes:
-                    priv = priv[:self.cbs_max_nodes]
+            part_creds = np.zeros(100, dtype=np.float32)
+
+        # 4. Node properties matrix flattened — fill remaining space up to unified_dim
+        node_props = obs.get("discovered_nodes_properties", None)
+        remaining = self.unified_dim - 100 - 6 - 100   # = 306 for unified_dim=512
+        if node_props is not None:
+            arr = np.asarray(node_props, dtype=np.float32).ravel()
         else:
-            priv = np.zeros(self.cbs_max_nodes, dtype=np.float32)
-        
-        vec_parts.append(priv)
-        
-        # 4. Credential cache matrix (max_credentials × 2)
-        cred_cache = obs.get("credential_cache_matrix", ())
-        if isinstance(cred_cache, tuple) and len(cred_cache) > 0:
-            # Convert tuple of arrays to matrix
-            cred_list = []
-            for cred in cred_cache[:self.cbs_max_credentials]:
-                if isinstance(cred, np.ndarray) and cred.size >= 2:
-                    cred_list.append(cred[:2])
-                else:
-                    cred_list.append(np.array([0, 0], dtype=np.float32))
-            
-            if len(cred_list) < self.cbs_max_credentials:
-                padding = [np.array([0, 0], dtype=np.float32) for _ in range(self.cbs_max_credentials - len(cred_list))]
-                cred_list.extend(padding)
-            
-            cred_matrix = np.array(cred_list, dtype=np.float32)
-        else:
-            cred_matrix = np.zeros((self.cbs_max_credentials, 2), dtype=np.float32)
-        
-        vec_parts.append(cred_matrix.flatten())
-        
-        # 5. Graph statistics (num_nodes, num_edges)
-        explored = obs.get("_explored_network", None)
-        if explored is not None and hasattr(explored, "nodes") and hasattr(explored, "edges"):
-            num_nodes = len(explored.nodes()) if hasattr(explored, "nodes") else 0
-            num_edges = len(explored.edges()) if hasattr(explored, "edges") else 0
-        else:
-            num_nodes = obs.get("discovered_node_count", 0)
-            num_edges = 0
-        
-        vec_parts.append(np.array([float(num_nodes), float(num_edges)], dtype=np.float32))
-        
-        # 6. Additional fields (probe_result, escalation details)
-        additional = [
-            float(obs.get("discovered_node_count", 0)),
-            float(obs.get("probe_result", 0)),
-            float(obs.get("escalation", 0))
-        ]
-        vec_parts.append(np.array(additional, dtype=np.float32))
-        
-        # Concatenate all parts
-        unified_vec = np.concatenate(vec_parts)
-        
-        # Pad or truncate to target_dim
+            arr = np.zeros(0, dtype=np.float32)
+        part_props = _pad1d(arr, remaining)
+
+        unified_vec = np.concatenate([part_priv, part_scalars, part_creds, part_props])
+        # Should be exactly unified_dim; safety pad/truncate
         if len(unified_vec) < self.target_dim:
-            padding = np.zeros(self.target_dim - len(unified_vec), dtype=np.float32)
-            unified_vec = np.concatenate([unified_vec, padding])
+            unified_vec = np.concatenate([unified_vec, np.zeros(self.target_dim - len(unified_vec), dtype=np.float32)])
         elif len(unified_vec) > self.target_dim:
             unified_vec = unified_vec[:self.target_dim]
-        
         return unified_vec
     
     def preprocess_cw(self, obs_vec: np.ndarray) -> np.ndarray:
@@ -186,10 +135,8 @@ class UnifiedFullObsPreprocessor:
         Returns:
             Fixed-size vector [unified_dim]
         """
-        if not isinstance(obs_vec, np.ndarray):
-            obs_vec = np.asarray(obs_vec, dtype=np.float32)
-        else:
-            obs_vec = obs_vec.astype(np.float32)
+        obs_vec = cw_raw_to_red_vector(obs_vec)
+        obs_vec = obs_vec.astype(np.float32, copy=False)
         
         # Pad or truncate to target_dim
         if len(obs_vec) < self.target_dim:

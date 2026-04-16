@@ -1,5 +1,7 @@
 
 import numpy as np
+import torch
+from typing import Optional
 
 OBS_DIM = 8
 
@@ -31,8 +33,38 @@ def _sum_flag(seq, *flag_names):
     return total
 
 class ObservationTranslator:
-    def __init__(self):
+    def __init__(self, use_transfer: bool = False, encoder_path: Optional[str] = None, 
+                 feature_size: int = 64, device: Optional[torch.device] = None):
+        """
+        Initialize observation translator with optional transfer learning encoder.
+        
+        Args:
+            use_transfer: Whether to use transfer learning encoder
+            encoder_path: Path to saved encoder checkpoint
+            feature_size: Size of feature space (if loading encoder)
+            device: Device to run encoder on
+        """
         self.default_scales = np.array([50, 50, 50, 200, 50, 1000, 20.0, 100], dtype=np.float32)
+        self.use_transfer = use_transfer
+        self.encoder = None
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        if use_transfer and encoder_path:
+            try:
+                # Prefer DAPN encoder (main pipeline); fall back to legacy transfer_encoder
+                try:
+                    from adapters.dapn_observation_encoder import DAPNObservationTranslator
+                    _t = DAPNObservationTranslator(use_dapn=True, encoder_path=encoder_path,
+                                                   feature_size=feature_size, device=self.device)
+                    self.encoder = _t.shared_encoder or _t.cbs_encoder
+                except Exception:
+                    from adapters.transfer_encoder import ObservationEncoder, load_transfer_models
+                    self.encoder, _ = load_transfer_models(encoder_path, self.device)
+                self.encoder.eval()
+                print(f"Loaded transfer encoder from {encoder_path}")
+            except Exception as e:
+                print(f"Warning: Could not load encoder from {encoder_path}: {e}")
+                self.use_transfer = False
 
     # -------- CyberBattleSim mapping (matches the schema you posted) --------
     def from_cbs(self, obs) -> np.ndarray:
@@ -71,7 +103,10 @@ class ObservationTranslator:
         except Exception:
             steps_elapsed = 0
 
-        dist_goal = 0.0
+        if discovered_node_count > 0:
+            dist_goal = (1.0 - compromised_hosts / float(discovered_node_count)) * self.default_scales[6]
+        else:
+            dist_goal = float(self.default_scales[6])
 
         probe_result = int(obs.get("probe_result", 0) or 0)
         escalation_val = int(obs.get("escalation", 0) or 0)
@@ -88,13 +123,20 @@ class ObservationTranslator:
             alerts
         ], dtype=_np.float32)
 
-        return self._normalize(vec)
+        vec_normalized = self._normalize(vec)
+        
+        # If using transfer, encode to feature space
+        if self.use_transfer and self.encoder is not None:
+            return self._encode_to_features(vec_normalized)
+        
+        return vec_normalized
 
     # -------- Cyberwheel RedObservation vector mapping --------
     def from_cw(self, obs_vec: np.ndarray) -> np.ndarray:
+        from adapters.kill_chain import cw_raw_to_red_vector
+
         HOST_ATTRS = 7  # type, sweeped, scanned, discovered, on_host, escalated, impacted
-        if not isinstance(obs_vec, np.ndarray):
-            obs_vec = np.asarray(obs_vec)
+        obs_vec = cw_raw_to_red_vector(obs_vec)
         n = int(obs_vec.size)
         standalone_len = n % HOST_ATTRS
         max_hosts = (n - standalone_len) // HOST_ATTRS if n >= HOST_ATTRS else 0
@@ -153,7 +195,7 @@ class ObservationTranslator:
         vec = np.array([
             discovered_hosts,
             compromised_hosts,
-            discovered_hosts,
+            total_hosts_present,
             known_vulns,
             credentials_found,
             steps_elapsed,
@@ -167,7 +209,31 @@ class ObservationTranslator:
         scales[1] = host_scale
         scales[2] = host_scale
 
-        return np.clip(vec / scales, 0.0, 1.0)
+        vec_normalized = np.clip(vec / scales, 0.0, 1.0)
+        
+        # If using transfer, encode to feature space
+        if self.use_transfer and self.encoder is not None:
+            return self._encode_to_features(vec_normalized)
+        
+        return vec_normalized
 
     def _normalize(self, vec: np.ndarray) -> np.ndarray:
         return np.clip(vec / self.default_scales, 0.0, 1.0)
+    
+    def _encode_to_features(self, obs: np.ndarray) -> np.ndarray:
+        """
+        Encode observation to feature space using transfer encoder.
+        
+        Args:
+            obs: Normalized observation vector [OBS_DIM]
+        
+        Returns:
+            features: Encoded features [feature_size]
+        """
+        if self.encoder is None:
+            return obs
+        
+        with torch.no_grad():
+            obs_tensor = torch.FloatTensor(obs).unsqueeze(0).to(self.device)
+            features = self.encoder(obs_tensor)
+            return features.squeeze(0).cpu().numpy()

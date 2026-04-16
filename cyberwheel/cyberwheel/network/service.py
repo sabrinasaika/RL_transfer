@@ -51,6 +51,18 @@ class Service(BaseModel):
             raise ProtocolValueError(value=proto, message=msg)
         return proto
 
+    @validator("version", pre=True)
+    @classmethod
+    def validate_version(cls, version) -> str | None:
+        """Convert integer versions to strings for compatibility with YAML configs"""
+        if version is None:
+            return None
+        if isinstance(version, int):
+            return str(version)
+        if isinstance(version, str):
+            return version
+        return str(version)  # Fallback: convert anything else to string
+
     # using classmethod here only so I don't have to hard code `Service`
     @classmethod
     def create_service_from_dict(cls: Type[T], service: dict[str, Any]) -> T:

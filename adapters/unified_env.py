@@ -6,6 +6,7 @@ from gymnasium import spaces
 from adapters.observation_translator import ObservationTranslator, OBS_DIM
 from adapters.action_translator import ActionTranslator
 from adapters.reward_normalizer import RewardNormalizer
+from adapters.kill_chain import stage_from_cbs, stage_from_cw
 
 
 class UnifiedSecEnv(gym.Env):
@@ -106,14 +107,9 @@ class UnifiedSecEnv(gym.Env):
             try:
                 if int(mask[int(action_idx)]) == 0 and mask.sum() > 0:
                     valid_idxs = np.where(mask > 0.0)[0]
-                    # Simple preference: remote > connect > local > noop when available
+                    # Preference: recon > move > escalate
                     names = self.act_t.unified_actions
-                    pref_order = [
-                        "remote_vulnerability",  # covers port_scan/lateral_move mapped types
-                        "connect",
-                        "local_vulnerability",
-                        "noop",
-                    ]
+                    pref_order = ["recon", "move", "escalate"]
                     # Map names to indices present in valid_idxs
                     name_to_idx = {n: i for i, n in enumerate(names)}
                     pick = None
@@ -216,6 +212,14 @@ class UnifiedSecEnv(gym.Env):
         self._last_raw_obs = raw_obs
         self._step_counter += 1
 
+        # Stage-transition reward (opt-in via USE_STAGE_REWARD=1)
+        try:
+            import os as _os
+            if _os.environ.get("USE_STAGE_REWARD", "0") == "1":
+                raw_r = self._stage_transition_reward(raw_obs)
+        except Exception:
+            pass
+
         if dbg_on and self.backend == "cbs":
             disc_total, new_disc, owned_total, new_owned = self._progress_snapshot(raw_obs)
             print(
@@ -268,6 +272,27 @@ class UnifiedSecEnv(gym.Env):
         # CyberWheel branch: expose underlying red_agent so translator can pick host indices
         red_agent = getattr(self.env, "red_agent", None)
         return self.act_t.to_cw(a, state=self._last_raw_obs, red_agent=red_agent)
+
+    def _stage_transition_reward(self, raw_obs_after) -> float:
+        """
+        Universal kill-chain stage-transition reward.
+        Identical formula in both CW and CBS — solves reward mismatch at transfer time.
+
+          reward = new_stage - old_stage   (0 most steps, +1 on each stage advance)
+
+        Enabled by setting USE_STAGE_REWARD=1 (default: 0 so existing behaviour unchanged).
+        """
+        try:
+            if self.backend == "cbs":
+                new_stage = stage_from_cbs(raw_obs_after if isinstance(raw_obs_after, dict) else {})
+            else:
+                new_stage = stage_from_cw(raw_obs_after)
+        except Exception:
+            new_stage = self._prev_stage
+
+        delta = max(0, new_stage - self._prev_stage)   # never negative (no penalty for regress)
+        self._prev_stage = new_stage
+        return float(delta)
 
     def _xlate_reward(self, r, info):
           # Optional shaping for CBS to provide fast non-zero signals during evaluation
@@ -342,13 +367,9 @@ class UnifiedSecEnv(gym.Env):
                   act_idx = None
               if act_idx is not None:
                   action_shape = {
-                      0: float(_os.environ.get("SHAPE_ACTION_NOOP", "0.0") or 0.0),
-                      1: float(_os.environ.get("SHAPE_ACTION_PING", "0.0") or 0.0),
-                      2: float(_os.environ.get("SHAPE_ACTION_PORT", "0.0") or 0.0),
-                      3: float(_os.environ.get("SHAPE_ACTION_DISC", "0.0") or 0.0),
-                      4: float(_os.environ.get("SHAPE_ACTION_LATERAL", "0.0") or 0.0),
-                      5: float(_os.environ.get("SHAPE_ACTION_ESC", "0.0") or 0.0),
-                      6: float(_os.environ.get("SHAPE_ACTION_IMPACT", "0.0") or 0.0),
+                      0: float(_os.environ.get("SHAPE_ACTION_RECON", "0.0") or 0.0),
+                      1: float(_os.environ.get("SHAPE_ACTION_MOVE", "0.0") or 0.0),
+                      2: float(_os.environ.get("SHAPE_ACTION_ESCALATE", "0.0") or 0.0),
                   }
                   shaped_bonus += action_shape.get(act_idx, 0.0)
               step_cost = float(_os.environ.get("SHAPE_STEP_COST", "0.0") or 0.0)
@@ -490,10 +511,11 @@ class UnifiedSecEnv(gym.Env):
         return backend_action
 
     def _compute_unified_mask(self) -> np.ndarray:
-        """Compute a 7-D unified action mask from CBS action mask.
-        noop always valid; other entries depend on whether CBS exposes at least
-        one valid low-level option for the mapped action type.
-        Order: [noop, ping_sweep, port_scan, discovery, lateral_move, privilege_escalation, impact]
+        """Compute a 3-D unified action mask from CBS action mask.
+        Order: [recon, move, escalate]
+          recon    valid if connect OR remote_vulnerability available
+          move     valid if connect available
+          escalate valid if local_vulnerability available
         """
         mask = np.ones((len(self.act_t.unified_actions),), dtype=np.float32)
         try:
@@ -506,22 +528,16 @@ class UnifiedSecEnv(gym.Env):
                     return bool(np.any(arr))
                 except Exception:
                     return False
-            # map
             has_connect = any_true("connect")
             has_remote = any_true("remote_vulnerability")
             has_local = any_true("local_vulnerability")
-            name_to_idx = {n:i for i,n in enumerate(self.act_t.unified_actions)}
-            # noop
-            mask[name_to_idx["noop"]] = 1.0
-            # ping_sweep, discovery via connect
-            mask[name_to_idx["ping_sweep"]] = 1.0 if has_connect else 0.0
-            mask[name_to_idx["discovery"]] = 1.0 if has_connect else 0.0
-            # port_scan, lateral_move via remote
-            mask[name_to_idx["port_scan"]] = 1.0 if has_remote else 0.0
-            mask[name_to_idx["lateral_move"]] = 1.0 if has_remote else 0.0
-            # privilege_escalation, impact via local
-            mask[name_to_idx["privilege_escalation"]] = 1.0 if has_local else 0.0
-            mask[name_to_idx["impact"]] = 1.0 if has_local else 0.0
+            name_to_idx = {n: i for i, n in enumerate(self.act_t.unified_actions)}
+            # recon: remote probe only — valid only when remote_vulnerability is available
+            mask[name_to_idx["recon"]] = 1.0 if has_remote else 0.0
+            # move: needs connect
+            mask[name_to_idx["move"]] = 1.0 if has_connect else 0.0
+            # escalate: needs local_vulnerability
+            mask[name_to_idx["escalate"]] = 1.0 if has_local else 0.0
         except Exception:
             pass
         return mask
@@ -531,6 +547,7 @@ class UnifiedSecEnv(gym.Env):
         self._prev_owned_total = 0
         self._last_probe_success_step = -1
         self._step_counter = 0
+        self._prev_stage = 0   # kill-chain stage at start of episode
 
     def _sync_progress_counters(self, raw):
         try:

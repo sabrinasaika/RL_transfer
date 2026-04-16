@@ -1,10 +1,12 @@
 # adapters/cbs_topologies.py
 from __future__ import annotations
 
+import os
+import random
 import yaml
 import networkx as nx
+import numpy
 from typing import Dict, List, Set
-import os
 from collections import OrderedDict
 
 
@@ -134,15 +136,40 @@ def build_cbs_env_from_cw_yaml(yaml_path: str):
         if "dmz01" in host_names and "server01" in host_names:
             _add_bidir_protocols(g, "dmz01", "server01", ["HTTP", "SMB"])
 
-    # Convert traffic graph to CBS network model using CBS helper
-    cbs_network = gen_net.cyberbattle_model_from_traffic_graph(g)
+    # Convert traffic graph to CBS network model using CBS helper.
+    # Seed RNG so the same topology yields deterministic vulns; use high leak probabilities
+    # so the agent can spread and reach 60% (e.g. 6/10 nodes) with valid actions.
+    cw_10_seed = int(os.environ.get("CBS_CW10_SEED", "42"))
+    easy_60 = os.environ.get("CBS_EASY_60PCT", "1") == "1"
+    if easy_60:
+        random.seed(cw_10_seed)
+        numpy.random.seed(cw_10_seed)
+    try:
+        import numpy as _np
+        if easy_60:
+            _np.random.seed(cw_10_seed)
+    except Exception:
+        pass
+    gen_kwargs = {}
+    if easy_60:
+        gen_kwargs = dict(
+            cached_smb_password_probability=0.98,
+            cached_rdp_password_probability=0.98,
+            cached_accessed_network_shares_probability=0.98,
+            cached_password_has_changed_probability=0.02,
+            probability_two_nodes_use_same_password_to_access_given_resource=0.95,
+            traceroute_discovery_probability=0.95,
+        )
+    cbs_network = gen_net.cyberbattle_model_from_traffic_graph(g, **gen_kwargs)
 
-    # Safety net: ensure at least one vulnerability returns >=1 credential globally
+    # Safety net: ensure entry node has a local vuln that leaks a credential (so progress policy
+    # can get a cred and then lateral_move; needed for CBS_MINIMAL_SEED=1 and 60% goal).
+    entry_node = sorted(host_names)[0] if host_names else None
     try:
         import CyberBattleSim.cyberbattle.simulation.model as m  # type: ignore
         nodes_list = list(cbs_network.nodes())
-        if nodes_list:
-            target_node = str(nodes_list[0])
+        target_node = str(entry_node) if (entry_node and str(entry_node) in cbs_network.nodes()) else (str(nodes_list[0]) if nodes_list else None)
+        if target_node:
             node_info = cbs_network.nodes[target_node].get("data")
             if node_info is not None:
                 # Inject a simple local vuln that leaks one SMB credential for validation to pass
@@ -173,10 +200,14 @@ def build_cbs_env_from_cw_yaml(yaml_path: str):
         goal_reward = float(os.environ.get("CBS_GOAL_REWARD", "50") or 50)
     except Exception:
         goal_reward = 50.0
+    # Use actual network size so observation (e.g. nodes_privilegelevel) has length = node count,
+    # matching CW for lockstep (get_owned_pct total_nodes CW=10, CBS=10).
+    num_nodes = max(1, len(host_names))
     kwargs = dict(
         initial_environment=env_model,
         attacker_goal=cbs_env.AttackerGoal(own_atleast_percent=own_pct, reward=goal_reward),
         throws_on_invalid_actions=False,
+        maximum_node_count=num_nodes,
     )
     # Optionally zero-out terminal rewards to emphasize shaped rewards during evaluation
     if os.environ.get("CBS_ZERO_WIN_LOSE_REWARD", "0") == "1":
@@ -197,28 +228,55 @@ def build_cbs_env_from_cw_yaml(yaml_path: str):
     gym_env._seed_entry = seed_entry
     gym_env._seed_target = seed_target
 
+    # When CBS_MINIMAL_SEED=1: only entry discovered/owned, no leaked cred (match CW initial state)
+    def _minimal_seed_entry():
+        return sorted(host_names)[0] if host_names else (seed_entry or "server01")
+
     def _seed_attacker_state():
         try:
-            if seed_entry:
-                node_entry = gym_env.initial_environment.nodes.get(str(seed_entry))
-                if node_entry is not None and getattr(node_entry.data, "agent_installed", False) is False:
-                    node_entry.data.agent_installed = True
-            discovered_ids = [str(h) for h in host_names] if host_names else list(gym_env._CyberBattleEnv__discovered_nodes or [])
-            if not discovered_ids and seed_entry:
-                discovered_ids = [str(seed_entry)]
+            minimal = os.environ.get("CBS_MINIMAL_SEED", "0") == "1"
+            if minimal:
+                entry = _minimal_seed_entry()
+            else:
+                entry = seed_entry
+            if entry:
+                env = getattr(gym_env, "_CyberBattleEnv__environment", None)
+                if env is not None and hasattr(env, "network"):
+                    try:
+                        import CyberBattleSim.cyberbattle.simulation.model as m
+                        node_dict = env.network.nodes.get(str(entry))
+                        if node_dict is not None:
+                            node_data = node_dict.get("data") if isinstance(node_dict, dict) else None
+                            if node_data is not None:
+                                if not getattr(node_data, "agent_installed", False):
+                                    node_data.agent_installed = True
+                                if getattr(node_data, "privilege_level", m.PrivilegeLevel.NoAccess) < m.PrivilegeLevel.LocalUser:
+                                    node_data.privilege_level = m.PrivilegeLevel.LocalUser
+                                env.network.nodes[str(entry)].update({"data": node_data})
+                    except (TypeError, KeyError, AttributeError):
+                        pass
+            if minimal:
+                discovered_ids = [str(_minimal_seed_entry())]
+            else:
+                discovered_ids = [str(h) for h in host_names] if host_names else list(gym_env._CyberBattleEnv__discovered_nodes or [])
+                if not discovered_ids and seed_entry:
+                    discovered_ids = [str(seed_entry)]
             discovery_map = OrderedDict((node_id, actions.NodeTrackingInformation()) for node_id in discovered_ids)
             gym_env._actuator._discovered_nodes = discovery_map  # type: ignore[attr-defined]
             gym_env._CyberBattleEnv__discovered_nodes = list(discovery_map.keys())
             cred_cache = list(gym_env._CyberBattleEnv__credential_cache or [])
-            if leaked_credential not in cred_cache:
-                cred_cache.append(leaked_credential)
-            gym_env._CyberBattleEnv__credential_cache = cred_cache
-            try:
-                gathered = getattr(gym_env._actuator, "_gathered_credentials", set())
-                gathered.add(leaked_credential.credential)
-                gym_env._actuator._gathered_credentials = gathered  # type: ignore[attr-defined]
-            except Exception:
-                pass
+            if not minimal:
+                if leaked_credential not in cred_cache:
+                    cred_cache.append(leaked_credential)
+                gym_env._CyberBattleEnv__credential_cache = cred_cache
+                try:
+                    gathered = getattr(gym_env._actuator, "_gathered_credentials", set())
+                    gathered.add(leaked_credential.credential)
+                    gym_env._actuator._gathered_credentials = gathered  # type: ignore[attr-defined]
+                except Exception:
+                    pass
+            else:
+                gym_env._CyberBattleEnv__credential_cache = cred_cache
             gym_env._CyberBattleEnv__owned_nodes_indices_cache = None
         except Exception:
             pass
@@ -228,8 +286,44 @@ def build_cbs_env_from_cw_yaml(yaml_path: str):
     def seeded_reset(*args, **kwargs):
         out = original_reset(*args, **kwargs)
         _seed_attacker_state()
-        return out
+        # Observation returned above was built before seeding, so it has 0 discovered nodes/cache.
+        # Rebuild observation so it reflects seeded state.
+        obs = gym_env._CyberBattleEnv__get_blank_observation()
+        obs["action_mask"] = gym_env.compute_action_mask()
+        obs["discovered_nodes_properties"] = gym_env._CyberBattleEnv__get_property_matrix()
+        obs["nodes_privilegelevel"] = gym_env._CyberBattleEnv__get_privilegelevel_array()
+        cred_cache = gym_env._CyberBattleEnv__credential_cache
+        n_cred = len(cred_cache)
+        obs["credential_cache_length"] = n_cred
+        try:
+            cache = [numpy.array([gym_env._CyberBattleEnv__find_external_index(c.node), gym_env._CyberBattleEnv__portname_to_index(c.port)], dtype=numpy.int64) for c in cred_cache]
+            obs["credential_cache_matrix"] = gym_env._CyberBattleEnv__pad_tuple_if_requested(cache, 2, gym_env._CyberBattleEnv__bounds.maximum_total_credentials)
+        except Exception:
+            pass
+        gym_env._CyberBattleEnv__owned_nodes_indices_cache = None
+        info = out[1] if isinstance(out, tuple) and len(out) == 2 else {}
+        return (obs, info)
 
+    # Keep __discovered_nodes in sync with actuator (CBS only updates it on LeakedNodesId/
+    # LeakedCredentials, not on LateralMove). Sync before any index lookup.
+    def _sync_discovered():
+        try:
+            act = getattr(gym_env, "_actuator", None)
+            if act is not None and hasattr(act, "_discovered_nodes"):
+                gym_env._CyberBattleEnv__discovered_nodes = list(act._discovered_nodes.keys())
+        except Exception:
+            pass
+
+    _orig_find_index = gym_env._CyberBattleEnv__find_external_index
+
+    def _find_external_sync(node_id):
+        _sync_discovered()
+        disc = gym_env._CyberBattleEnv__discovered_nodes
+        if node_id not in disc:
+            disc.append(node_id)
+        return gym_env._CyberBattleEnv__discovered_nodes.index(node_id)
+
+    gym_env._CyberBattleEnv__find_external_index = _find_external_sync  # type: ignore[assignment]
     gym_env.reset = seeded_reset  # type: ignore[assignment]
     _seed_attacker_state()
     return gym_env

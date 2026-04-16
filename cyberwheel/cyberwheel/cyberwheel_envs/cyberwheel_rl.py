@@ -163,7 +163,11 @@ class CyberwheelRL(gym.Env, Cyberwheel):
         self.current_step = 0
 
         self.network.reset()
-        self.network = self.network if self.evaluation else random.choice(list(self.networks.values()))
+        # Deterministic: use single network when only one exists; otherwise choice (call set_seed before reset)
+        if self.evaluation or len(self.networks) <= 1:
+            self.network = next(iter(self.networks.values()))
+        else:
+            self.network = random.choice(list(self.networks.values()))
 
         self.red_agent.reset(self.network, self.args.service_mapping[self.network.name])
         self.blue_agent.reset(self.network)

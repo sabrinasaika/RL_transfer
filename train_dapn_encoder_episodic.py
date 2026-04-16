@@ -18,6 +18,8 @@ Validation note:
 import os
 import sys
 import random
+import hashlib
+import pickle
 from pathlib import Path
 
 project_root = Path(__file__).parent
@@ -798,15 +800,35 @@ def _load_cbs_policy(cbs_policy_path):
         return None
 
 
-def _cw_policy_action(cw_policy, cw_policy_type, cw_device, obs, raw, deterministic=False):
-    """Get action from CW policy given env obs and raw obs."""
+def _cw_policy_action(cw_policy, cw_policy_type, cw_device, obs, raw, deterministic=False, cw_encoder=None):
+    """Get action from CW policy given env obs and raw obs. cw_encoder: callable raw_cw -> encoded (e.g. 256D) when policy expects DAPN-encoded obs."""
     if cw_policy_type == "ppo":
-        # Env returns 8D unified obs; use it (or convert raw to 8D if policy expects 8D and we have raw)
-        policy_obs = obs.get("obs", obs) if isinstance(obs, dict) else obs
-        policy_obs = np.asarray(policy_obs, dtype=np.float32)
-        if policy_obs.size != 8 and raw is not None:
-            from adapters.observation_translator import ObservationTranslator
-            policy_obs = ObservationTranslator().from_cw(np.asarray(raw, dtype=np.float32))
+        obs_space = getattr(cw_policy, "observation_space", None)
+        expected_dim = None
+        if obs_space is not None and hasattr(obs_space, "shape") and len(obs_space.shape) > 0:
+            expected_dim = int(obs_space.shape[0])
+        # Policy trained with DAPN wrapper expects 256D encoded obs
+        if expected_dim is not None and expected_dim != 8 and raw is not None and cw_encoder is not None:
+            policy_obs = cw_encoder(np.asarray(raw, dtype=np.float32))
+            policy_obs = np.asarray(policy_obs, dtype=np.float32).flatten()
+        else:
+            # 8D unified or Dict
+            policy_obs = obs.get("obs", obs) if isinstance(obs, dict) else obs
+            policy_obs = np.asarray(policy_obs, dtype=np.float32).flatten()
+            if policy_obs.size != 8 and raw is not None and (expected_dim is None or expected_dim == 8):
+                from adapters.observation_translator import ObservationTranslator
+                policy_obs = ObservationTranslator().from_cw(np.asarray(raw, dtype=np.float32))
+            if expected_dim is not None and expected_dim != 8 and cw_encoder is None:
+                raise ValueError(
+                    f"Leader policy expects {expected_dim}-dim observation (DAPN-encoded). "
+                    "Provide --encoder path/to/dapn_encoder_episodic.pt to encode observations during collection."
+                )
+        # SB3 policy may expect Dict(obs=..., mask=...); wrap if so
+        if obs_space is not None and hasattr(obs_space, "spaces") and isinstance(getattr(obs_space, "spaces", None), dict):
+            policy_obs = {
+                "obs": np.asarray(policy_obs, dtype=np.float32),
+                "mask": np.ones(7, dtype=np.float32),
+            }
         action, _ = cw_policy.predict(policy_obs, deterministic=deterministic)
         return int(action)
     else:
@@ -820,14 +842,408 @@ def _cw_policy_action(cw_policy, cw_policy_type, cw_device, obs, raw, determinis
 def _cbs_policy_action(cbs_policy, obs, deterministic=False):
     """Get action from CBS policy given env obs."""
     policy_obs_space = getattr(cbs_policy, "observation_space", None)
-    if policy_obs_space is not None and hasattr(policy_obs_space, "spaces"):
-        policy_obs = obs if isinstance(obs, dict) else {"obs": np.asarray(obs, dtype=np.float32), "mask": np.ones(7, dtype=np.float32)}
+    expects_dict = (
+        policy_obs_space is not None
+        and hasattr(policy_obs_space, "spaces")
+        and isinstance(getattr(policy_obs_space, "spaces", None), dict)
+    )
+    if expects_dict:
+        obs_arr = obs.get("obs", obs) if isinstance(obs, dict) else obs
+        mask_arr = obs.get("mask", None) if isinstance(obs, dict) else None
+        policy_obs = {
+            "obs": np.asarray(obs_arr, dtype=np.float32).flatten(),
+            "mask": np.asarray(mask_arr, dtype=np.float32).flatten() if mask_arr is not None else np.ones(7, dtype=np.float32),
+        }
     else:
         policy_obs = obs.get("obs", obs) if isinstance(obs, dict) else obs
-        if not isinstance(policy_obs, np.ndarray):
-            policy_obs = np.array(policy_obs, dtype=np.float32)
+        policy_obs = np.asarray(policy_obs, dtype=np.float32).flatten()
     action, _ = cbs_policy.predict(policy_obs, deterministic=deterministic)
     return int(action)
+
+
+def _make_cw_encoder_for_policy(encoder_path, policy_observation_dim, default_path="artifacts/transfer_models/dapn_encoder_episodic.pt"):
+    """If policy expects encoded dim (e.g. 256), load DAPN encoder and return callable raw_cw -> encoded; else return None."""
+    if policy_observation_dim is None or policy_observation_dim == 8:
+        return None
+    path = encoder_path or default_path
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        from adapters.dapn_unified_full_obs_translator import DAPNUnifiedFullObsTranslator
+        import torch
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        translator = DAPNUnifiedFullObsTranslator(
+            use_dapn=True,
+            encoder_path=path,
+            feature_size=policy_observation_dim,
+            unified_dim=512,
+            device=device,
+        )
+        def encode(raw):
+            out = translator.from_cw(np.asarray(raw, dtype=np.float32))
+            return np.asarray(out, dtype=np.float32).flatten()
+        return encode
+    except Exception as e:
+        print(f"  Warning: could not load encoder from {path}: {e}")
+        return None
+
+
+def _checksum_obs(obs):
+    """Deterministic checksum for comparing observations across runs."""
+    if obs is None:
+        return "None"
+    if isinstance(obs, np.ndarray):
+        return hashlib.md5(obs.tobytes()).hexdigest()[:12]
+    try:
+        return hashlib.md5(pickle.dumps(obs, protocol=4)).hexdigest()[:12]
+    except Exception:
+        return hashlib.md5(str(obs).encode()).hexdigest()[:12]
+
+
+def verify_lockstep_determinism(
+    seed=42,
+    leader_policy_path=None,
+    leader_backend="cw",
+    max_steps_per_episode=15,
+    num_episodes=1,
+    encoder_path=None,
+):
+    """
+    Run lockstep collection twice with the same seed and print step-by-step
+    comparison to prove the same (state, action) sequence appears.
+    """
+    from config.env_builders import make_cbs_env, make_cw_env
+
+    if not leader_policy_path or not os.path.exists(leader_policy_path):
+        print("verify_lockstep_determinism: --leader-policy path is required and must exist.")
+        return False
+
+    orig_cbs = os.environ.get("CBS_ENV")
+    orig_det = os.environ.get("DETERMINISTIC_BACKEND_ACTION")
+    try:
+        os.environ["CBS_ENV"] = "CyberBattleCW10-v0"
+        os.environ["DETERMINISTIC_BACKEND_ACTION"] = "1"
+    except Exception:
+        pass
+
+    cw_policy, cw_ptype, cw_device = _load_cw_policy(leader_policy_path if leader_backend == "cw" else None)
+    cbs_policy = _load_cbs_policy(leader_policy_path if leader_backend == "cbs" else None)
+    if cw_policy is None and cbs_policy is None:
+        print("Could not load leader policy.")
+        return False
+
+    cw_encoder = None
+    if leader_backend == "cw" and cw_policy is not None:
+        obs_space = getattr(cw_policy, "observation_space", None)
+        expected_dim = int(obs_space.shape[0]) if obs_space is not None and hasattr(obs_space, "shape") and len(obs_space.shape) > 0 else None
+        if expected_dim is not None and expected_dim != 8:
+            cw_encoder = _make_cw_encoder_for_policy(encoder_path, expected_dim)
+
+    def run_one():
+        np.random.seed(seed)
+        random.seed(seed)
+        cw_env = UnifiedSecEnv("cw", cw_factory=make_cw_env)
+        cbs_env = UnifiedSecEnv("cbs", cbs_factory=make_cbs_env)
+        steps = []
+        for episode in range(num_episodes):
+            ep_seed = seed + episode
+            obs_cw, _ = cw_env.reset(seed=ep_seed)
+            obs_cbs, _ = cbs_env.reset(seed=ep_seed)
+            done_cw, done_cbs = False, False
+            step = 0
+            while step < max_steps_per_episode and not (done_cw or done_cbs):
+                raw_cw = getattr(cw_env, "_last_raw_obs", None)
+                if raw_cw is None:
+                    raw_cw = obs_cw if isinstance(obs_cw, np.ndarray) else np.array([], dtype=np.float32)
+                if not isinstance(raw_cw, np.ndarray):
+                    raw_cw = np.array([], dtype=np.float32)
+                raw_cbs = getattr(cbs_env, "_last_raw_cbs_obs", None) or getattr(cbs_env, "_last_raw_obs", None)
+                if raw_cbs is None:
+                    raw_cbs = obs_cbs if isinstance(obs_cbs, dict) else {}
+                action = _unified_action_from_leader(
+                    leader_backend, cw_policy, cw_ptype, cw_device, cbs_policy,
+                    obs_cw, obs_cbs, raw_cw, step, deterministic=True, cw_encoder=cw_encoder
+                )
+                action = int(np.clip(action, 0, 6))
+                steps.append({
+                    "cw_checksum": _checksum_obs(raw_cw),
+                    "cbs_checksum": _checksum_obs(raw_cbs),
+                    "action": action,
+                })
+                obs_cw, _, done_cw, truncated_cw, _ = cw_env.step(action)
+                done_cw = done_cw or truncated_cw
+                obs_cbs, _, done_cbs, truncated_cbs, _ = cbs_env.step(action)
+                done_cbs = done_cbs or truncated_cbs
+                step += 1
+        return steps
+
+    print("=" * 60)
+    print("Verifying lockstep determinism (two runs with same seed)")
+    print("=" * 60)
+    print(f"  Seed={seed}, episodes={num_episodes}, max_steps={max_steps_per_episode}")
+    print("  Run 1...")
+    run1 = run_one()
+    print("  Run 2...")
+    run2 = run_one()
+    if orig_cbs is not None:
+        os.environ["CBS_ENV"] = orig_cbs
+    elif "CBS_ENV" in os.environ:
+        os.environ.pop("CBS_ENV", None)
+    if orig_det is not None:
+        os.environ["DETERMINISTIC_BACKEND_ACTION"] = orig_det
+    elif "DETERMINISTIC_BACKEND_ACTION" in os.environ:
+        os.environ.pop("DETERMINISTIC_BACKEND_ACTION", None)
+
+    n = min(len(run1), len(run2))
+    all_ok = True
+    print()
+    print("Step | action R1/R2 | CW_checksum R1/R2  | CBS_checksum R1/R2  | match")
+    print("-" * 72)
+    for i in range(n):
+        a1, a2 = run1[i]["action"], run2[i]["action"]
+        cw1, cw2 = run1[i]["cw_checksum"], run2[i]["cw_checksum"]
+        cb1, cb2 = run1[i]["cbs_checksum"], run2[i]["cbs_checksum"]
+        match = a1 == a2 and cw1 == cw2 and cb1 == cb2
+        if not match:
+            all_ok = False
+        sym = "OK" if match else "MISMATCH"
+        print(f"  {i:2d}  |    {a1} / {a2}     | {cw1} / {cw2} | {cb1} / {cb2} | {sym}")
+    if len(run1) != len(run2):
+        all_ok = False
+        print(f"  Length mismatch: Run1={len(run1)} steps, Run2={len(run2)} steps")
+    print("-" * 72)
+    print("  All steps match (same state & action across runs):", all_ok)
+    print("=" * 60)
+    return all_ok
+
+
+def _unified_action_from_leader(leader_backend, cw_policy, cw_ptype, cw_device, cbs_policy, obs_cw, obs_cbs, raw_cw, step_index, deterministic=True, cw_encoder=None):
+    """
+    Get one unified action (0-6) deterministically from the chosen leader env/policy.
+    Used for lockstep collection so the same action is applied to both CW and CBS.
+    cw_encoder: callable raw_cw -> encoded array when policy expects DAPN-encoded (e.g. 256D).
+    """
+    if leader_backend == "cw" and cw_policy is not None:
+        return _cw_policy_action(cw_policy, cw_ptype, cw_device, obs_cw, raw_cw, deterministic=deterministic, cw_encoder=cw_encoder)
+    if leader_backend == "cbs" and cbs_policy is not None:
+        return _cbs_policy_action(cbs_policy, obs_cbs, deterministic=deterministic)
+    # Fallback only when not used from lockstep (lockstep requires leader policy)
+    return step_index % 7
+
+
+def collect_observations_deterministic_lockstep(
+    num_samples=1000,
+    save_path=None,
+    val_fraction=0.2,
+    seed=42,
+    leader_policy_path=None,
+    leader_backend="cw",
+    max_steps_per_episode=200,
+    num_episodes=None,
+    encoder_path=None,
+):
+    """
+    Collect paired (CW, CBS) observations in lockstep with a deterministic policy.
+
+    - Same seed per episode for both envs so initial states are comparable
+      (use CBS_ENV=CyberBattleCW10-v0 to align topology with Cyberwheel).
+    - One deterministic action is chosen each step (from leader policy or a fixed rule)
+      and applied to BOTH environments.
+    - Episodes end together: when either env is done or max_steps is reached,
+      both stop so step count stays aligned.
+
+    Uses all obs (full raw observations from both envs) and all action (unified index
+    plus full backend actions: CW red/blue dict, CBS connect/remote_vulnerability/local_vulnerability dict).
+
+    Returns: (source_obs_list, target_obs_list, val_obs_list, source_actions_list, target_actions_list)
+    and saves source_backend_actions, target_backend_actions when save_path is set.
+    """
+    from config.env_builders import make_cbs_env, make_cw_env
+
+    # Align CBS topology with Cyberwheel (same logical nodes/goal) when available
+    orig_cbs = os.environ.get("CBS_ENV")
+    orig_det_action = os.environ.get("DETERMINISTIC_BACKEND_ACTION")
+    try:
+        os.environ["CBS_ENV"] = "CyberBattleCW10-v0"
+        os.environ["DETERMINISTIC_BACKEND_ACTION"] = "1"  # no random when mapping unified -> backend action
+    except Exception:
+        pass
+
+    if num_episodes is None:
+        num_episodes = max(1, (num_samples + max_steps_per_episode - 1) // max_steps_per_episode)
+    random.seed(seed)
+    np.random.seed(seed)
+
+    # Require leader policy: no random or round-robin actions in deterministic lockstep
+    if not leader_policy_path:
+        raise ValueError(
+            "Deterministic lockstep requires a leader policy (no random actions). "
+            "Provide --leader-policy path/to/ppo.zip (e.g. artifacts/policies/cw_ppo_dapn.zip)."
+        )
+    if not os.path.exists(leader_policy_path):
+        # Try adding .zip if user omitted extension
+        alt = f"{leader_policy_path}.zip" if not leader_policy_path.endswith(".zip") else None
+        hint = f" (try --leader-policy {alt})" if alt and os.path.exists(alt) else ""
+        dirname = os.path.dirname(leader_policy_path)
+        existing = []
+        if os.path.isdir(dirname):
+            existing = [f for f in os.listdir(dirname) if f.endswith((".zip", ".pt"))]
+        existing_hint = f" Existing: {existing[:5]}" if existing else ""
+        raise FileNotFoundError(
+            f"Leader policy file not found: {leader_policy_path}{hint}.{existing_hint}"
+        )
+    cw_policy, cw_ptype, cw_device = _load_cw_policy(leader_policy_path if leader_backend == "cw" else None)
+    cbs_policy = _load_cbs_policy(leader_policy_path if leader_backend == "cbs" else None)
+    if cw_policy is None and cbs_policy is None:
+        raise ValueError(
+            f"Could not load leader policy from {leader_policy_path}. "
+            "Use a PPO .zip trained on the unified env (outputs actions 0-6)."
+        )
+
+    # When leader is CW and policy expects DAPN-encoded (e.g. 256D), load encoder
+    cw_encoder = None
+    if leader_backend == "cw" and cw_policy is not None:
+        obs_space = getattr(cw_policy, "observation_space", None)
+        expected_dim = None
+        if obs_space is not None and hasattr(obs_space, "shape") and len(obs_space.shape) > 0:
+            expected_dim = int(obs_space.shape[0])
+        if expected_dim is not None and expected_dim != 8:
+            cw_encoder = _make_cw_encoder_for_policy(encoder_path, expected_dim)
+            if cw_encoder is None:
+                raise ValueError(
+                    f"Leader policy expects {expected_dim}-dim (DAPN-encoded) observation. "
+                    "Provide --encoder path/to/dapn_encoder_episodic.pt (or train and save the encoder first)."
+                )
+            print(f"  Using encoder to produce {expected_dim}-dim obs for leader policy.")
+
+    source_obs_list = []
+    target_obs_list = []
+    source_actions_list = []
+    target_actions_list = []
+    source_backend_actions_list = []
+    target_backend_actions_list = []
+
+    try:
+        cw_env = UnifiedSecEnv("cw", cw_factory=make_cw_env)
+        cbs_env = UnifiedSecEnv("cbs", cbs_factory=make_cbs_env)
+    except Exception as e:
+        print(f"  Error creating envs: {e}")
+        if orig_cbs is not None:
+            os.environ["CBS_ENV"] = orig_cbs
+        elif "CBS_ENV" in os.environ:
+            os.environ.pop("CBS_ENV", None)
+        if orig_det_action is not None:
+            os.environ["DETERMINISTIC_BACKEND_ACTION"] = orig_det_action
+        elif "DETERMINISTIC_BACKEND_ACTION" in os.environ:
+            os.environ.pop("DETERMINISTIC_BACKEND_ACTION", None)
+        return [], [], [], [], []
+
+    print("Deterministic lockstep collection: same seed per episode, same action to both envs")
+    pbar = tqdm(desc="Lockstep episodes", unit="ep")
+    step_count = 0
+
+    for episode in range(num_episodes):
+        ep_seed = seed + episode
+        obs_cw, _ = cw_env.reset(seed=ep_seed)
+        obs_cbs, _ = cbs_env.reset(seed=ep_seed)
+
+        done_cw, done_cbs = False, False
+        step = 0
+        while step < max_steps_per_episode and not (done_cw or done_cbs):
+            raw_cw = getattr(cw_env, "_last_raw_obs", None)
+            if raw_cw is None:
+                raw_cw = obs_cw if isinstance(obs_cw, np.ndarray) else np.array([], dtype=np.float32)
+            if not isinstance(raw_cw, np.ndarray):
+                raw_cw = np.array([], dtype=np.float32)
+
+            raw_cbs = getattr(cbs_env, "_last_raw_cbs_obs", None) or getattr(cbs_env, "_last_raw_obs", None)
+            if raw_cbs is None:
+                raw_cbs = obs_cbs if isinstance(obs_cbs, dict) else {}
+
+            action = _unified_action_from_leader(
+                leader_backend, cw_policy, cw_ptype, cw_device, cbs_policy,
+                obs_cw, obs_cbs, raw_cw, step, deterministic=True, cw_encoder=cw_encoder
+            )
+            action = int(np.clip(action, 0, 6))
+
+            source_obs_list.append(raw_cw)
+            target_obs_list.append(raw_cbs)
+            source_actions_list.append(action)
+            target_actions_list.append(action)
+
+            obs_cw, _, done_cw, truncated_cw, _ = cw_env.step(action)
+            done_cw = done_cw or truncated_cw
+            obs_cbs, _, done_cbs, truncated_cbs, _ = cbs_env.step(action)
+            done_cbs = done_cbs or truncated_cbs
+            # Store full backend actions (all action) for each domain
+            backend_cw = getattr(cw_env, "_last_backend_action", None)
+            backend_cbs = getattr(cbs_env, "_last_backend_action", None)
+            source_backend_actions_list.append(backend_cw)
+            target_backend_actions_list.append(backend_cbs)
+            step += 1
+            step_count += 1
+
+        pbar.update(1)
+        if step_count >= num_samples:
+            break
+
+    pbar.close()
+    print(f"  Collected {len(source_obs_list)} paired samples (CW, CBS) in lockstep.")
+
+    # Validation split from target (keep backend actions aligned)
+    val_obs_list = []
+    if val_fraction > 0 and len(target_obs_list) > 0:
+        n_val = max(1, int(len(target_obs_list) * val_fraction))
+        val_obs_list = target_obs_list[:n_val]
+        target_obs_list = target_obs_list[n_val:]
+        target_actions_list = target_actions_list[n_val:]
+        source_obs_list = source_obs_list[n_val:]
+        source_actions_list = source_actions_list[n_val:]
+        source_backend_actions_list = source_backend_actions_list[n_val:]
+        target_backend_actions_list = target_backend_actions_list[n_val:]
+        print(f"  Validation: {len(val_obs_list)}; train: {len(source_obs_list)} paired")
+
+    # Optional shuffle (keeps pairs aligned if we shuffle by index)
+    if len(source_obs_list) > 0:
+        idxs = list(range(len(source_obs_list)))
+        random.shuffle(idxs)
+        source_obs_list = [source_obs_list[i] for i in idxs]
+        target_obs_list = [target_obs_list[i] for i in idxs]
+        source_actions_list = [source_actions_list[i] for i in idxs]
+        target_actions_list = [target_actions_list[i] for i in idxs]
+        source_backend_actions_list = [source_backend_actions_list[i] for i in idxs]
+        target_backend_actions_list = [target_backend_actions_list[i] for i in idxs]
+
+    if save_path:
+        os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
+        out = {
+            "source_obs": source_obs_list,
+            "target_obs": target_obs_list,
+            "val_obs": val_obs_list,
+            "source_actions": source_actions_list,
+            "target_actions": target_actions_list,
+            "source_backend_actions": source_backend_actions_list,
+            "target_backend_actions": target_backend_actions_list,
+        }
+        np.savez(save_path, **out, allow_pickle=True)
+        print(f"  Saved to {save_path} (full obs + unified and backend actions)")
+
+    if orig_cbs is not None:
+        os.environ["CBS_ENV"] = orig_cbs
+    elif "CBS_ENV" in os.environ:
+        os.environ.pop("CBS_ENV", None)
+    if orig_det_action is not None:
+        os.environ["DETERMINISTIC_BACKEND_ACTION"] = orig_det_action
+    elif "DETERMINISTIC_BACKEND_ACTION" in os.environ:
+        os.environ.pop("DETERMINISTIC_BACKEND_ACTION", None)
+
+    return (
+        source_obs_list,
+        target_obs_list,
+        val_obs_list,
+        source_actions_list,
+        target_actions_list,
+    )
 
 
 def collect_observations_episodic(
@@ -860,6 +1276,7 @@ def collect_observations_episodic(
     # ---- Source (Cyberwheel) ----
     source_obs_list = []
     source_actions_list = []
+    source_backend_actions_list = []
     cw_policy, cw_ptype, cw_device = _load_cw_policy(cw_policy_path)
     try:
         cw_env = UnifiedSecEnv("cw", cw_factory=make_cw_env)
@@ -878,6 +1295,7 @@ def collect_observations_episodic(
                     action = _cw_policy_action(cw_policy, cw_ptype, cw_device, obs, raw, deterministic=deterministic_policy)
                     source_actions_list.append(action)
                     obs, _, done, truncated, _ = cw_env.step(action)
+                    source_backend_actions_list.append(getattr(cw_env, "_last_backend_action", None))
                     step += 1
                     pbar.update(1)
             pbar.close()
@@ -891,15 +1309,18 @@ def collect_observations_episodic(
                 action = cw_env.action_space.sample()
                 source_actions_list.append(int(action))
                 cw_env.step(action)
+                source_backend_actions_list.append(getattr(cw_env, "_last_backend_action", None))
         print(f"  Collected {len(source_obs_list)} source (CW) samples.")
     except Exception as e:
         print(f"  Warning: could not collect Cyberwheel obs: {e}")
         source_obs_list = []
         source_actions_list = []
+        source_backend_actions_list = []
 
     # ---- Target (CyberBattleSim) ----
     target_obs_list = []
     target_actions_list = []
+    target_backend_actions_list = []
     cbs_policy = _load_cbs_policy(cbs_policy_path)
     try:
         cbs_env = UnifiedSecEnv("cbs", cbs_factory=make_cbs_env)
@@ -917,6 +1338,7 @@ def collect_observations_episodic(
                     action = _cbs_policy_action(cbs_policy, obs, deterministic=deterministic_policy)
                     target_actions_list.append(action)
                     obs, _, done, truncated, _ = cbs_env.step(action)
+                    target_backend_actions_list.append(getattr(cbs_env, "_last_backend_action", None))
                     step += 1
                     pbar.update(1)
             pbar.close()
@@ -930,11 +1352,13 @@ def collect_observations_episodic(
                 action = cbs_env.action_space.sample()
                 target_actions_list.append(int(action))
                 cbs_env.step(action)
+                target_backend_actions_list.append(getattr(cbs_env, "_last_backend_action", None))
         print(f"  Collected {len(target_obs_list)} target (CBS) samples.")
     except Exception as e:
         print(f"  Warning: could not collect CBS obs: {e}")
         target_obs_list = []
         target_actions_list = []
+        target_backend_actions_list = []
 
     # ---- Validation split from target ----
     val_obs_list = []
@@ -943,10 +1367,13 @@ def collect_observations_episodic(
         val_obs_list = target_obs_list[:n_val]
         target_obs_list = target_obs_list[n_val:]
         target_actions_list = target_actions_list[n_val:]
+        target_backend_actions_list = target_backend_actions_list[n_val:]
         print(f"  Validation: {len(val_obs_list)}; target train: {len(target_obs_list)}")
 
     source_actions_list = source_actions_list[:len(source_obs_list)]
     target_actions_list = target_actions_list[:len(target_obs_list)]
+    source_backend_actions_list = source_backend_actions_list[:len(source_obs_list)]
+    target_backend_actions_list = target_backend_actions_list[:len(target_obs_list)]
 
     # Shuffle
     if len(source_obs_list) > 0:
@@ -954,11 +1381,13 @@ def collect_observations_episodic(
         random.shuffle(idxs)
         source_obs_list = [source_obs_list[i] for i in idxs]
         source_actions_list = [source_actions_list[i] for i in idxs]
+        source_backend_actions_list = [source_backend_actions_list[i] for i in idxs]
     if len(target_obs_list) > 0:
         idxs = list(range(len(target_obs_list)))
         random.shuffle(idxs)
         target_obs_list = [target_obs_list[i] for i in idxs]
         target_actions_list = [target_actions_list[i] for i in idxs]
+        target_backend_actions_list = [target_backend_actions_list[i] for i in idxs]
 
     if save_path:
         os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
@@ -968,9 +1397,11 @@ def collect_observations_episodic(
             "val_obs": val_obs_list,
             "source_actions": source_actions_list if source_actions_list else [],
             "target_actions": target_actions_list if target_actions_list else [],
+            "source_backend_actions": source_backend_actions_list if source_backend_actions_list else [],
+            "target_backend_actions": target_backend_actions_list if target_backend_actions_list else [],
         }
         np.savez(save_path, **out, allow_pickle=True)
-        print(f"Saved observations to {save_path} (source=CW, target=CBS, includes actions for --label-mode situation_action)")
+        print(f"Saved observations to {save_path} (full obs + unified and backend actions for --label-mode situation_action)")
 
     return (
         source_obs_list,
@@ -1005,6 +1436,18 @@ if __name__ == "__main__":
                         help="Max steps per episode when using policies (default 200)")
     parser.add_argument("--deterministic-policy", action="store_true",
                         help="Use deterministic (greedy) policy when collecting with --cw-policy/--cbs-policy")
+    parser.add_argument("--deterministic-lockstep", action="store_true",
+                        help="Collect in lockstep: same seed per episode for CW and CBS, same action applied to both each step; episodes end together")
+    parser.add_argument("--leader-policy", type=str, default=None,
+                        help="Required for --deterministic-lockstep: path to one policy (CW or CBS PPO) that outputs unified actions 0-6; no random actions")
+    parser.add_argument("--leader-backend", type=str, default="cw", choices=["cw", "cbs"],
+                        help="For --deterministic-lockstep: which env drives the action (cw or cbs)")
+    parser.add_argument("--lockstep-seed", type=int, default=42,
+                        help="Base seed for deterministic lockstep (episode i uses seed + i)")
+    parser.add_argument("--encoder", type=str, default=None,
+                        help="For --deterministic-lockstep when leader policy expects 256D (DAPN-encoded): path to encoder .pt (e.g. artifacts/transfer_models/dapn_encoder_episodic.pt). Default: try that path.")
+    parser.add_argument("--verify-determinism", action="store_true",
+                        help="With --deterministic-lockstep: run collection twice with same seed and print step-by-step comparison to prove same (state, action) sequence")
     parser.add_argument("--eval-episodes", type=int, default=1000, help="Target FSL eval episodes")
     parser.add_argument("--test-interval", type=int, default=100, help="Run validation every N iterations")
     parser.add_argument(
@@ -1020,6 +1463,8 @@ if __name__ == "__main__":
     parser.add_argument("--gpu", action="store_true", help="Force GPU (cuda); error if not available. Default: auto (GPU if available).")
     parser.add_argument("--device", type=str, default=None, choices=["cuda", "cpu"],
                        help="Device to use: cuda or cpu (overrides auto/default)")
+    parser.add_argument("--collect-only", action="store_true",
+                       help="Only run data collection (deterministic lockstep or episodic); save to --save-data if set; then exit without training the encoder")
     
     args = parser.parse_args()
     
@@ -1047,20 +1492,53 @@ if __name__ == "__main__":
             print("  Labels will fall back to cluster. To use situation_action, collect data without --load-data")
             print("  (or use a file saved with --save-data so it contains source_actions and target_actions).")
     else:
-        source_obs_list, target_obs_list, val_obs_list, source_actions_list, target_actions_list = (
-            collect_observations_episodic(
-                num_samples=args.num_samples,
-                save_path=args.save_data,
-                val_fraction=0.2,
-                seed=42,
-                cw_policy_path=args.cw_policy,
-                cbs_policy_path=args.cbs_policy,
-                max_steps_per_episode=args.max_steps,
-                deterministic_policy=args.deterministic_policy,
+        if getattr(args, "deterministic_lockstep", False):
+            if getattr(args, "verify_determinism", False):
+                ok = verify_lockstep_determinism(
+                    seed=args.lockstep_seed,
+                    leader_policy_path=args.leader_policy,
+                    leader_backend=args.leader_backend,
+                    max_steps_per_episode=min(20, args.max_steps),
+                    num_episodes=1,
+                    encoder_path=getattr(args, "encoder", None),
+                )
+                if not ok:
+                    print("Verification failed: runs differed. Fix non-determinism before collecting.")
+                    sys.exit(1)
+                print("Verification passed. Proceeding with collection.\n")
+            source_obs_list, target_obs_list, val_obs_list, source_actions_list, target_actions_list = (
+                collect_observations_deterministic_lockstep(
+                    num_samples=args.num_samples,
+                    save_path=args.save_data,
+                    val_fraction=0.2,
+                    seed=args.lockstep_seed,
+                    leader_policy_path=args.leader_policy,
+                    leader_backend=args.leader_backend,
+                    max_steps_per_episode=args.max_steps,
+                    encoder_path=getattr(args, "encoder", None),
+                )
             )
-        )
+        else:
+            source_obs_list, target_obs_list, val_obs_list, source_actions_list, target_actions_list = (
+                collect_observations_episodic(
+                    num_samples=args.num_samples,
+                    save_path=args.save_data,
+                    val_fraction=0.2,
+                    seed=42,
+                    cw_policy_path=args.cw_policy,
+                    cbs_policy_path=args.cbs_policy,
+                    max_steps_per_episode=args.max_steps,
+                    deterministic_policy=args.deterministic_policy,
+                )
+            )
     
     print("Source domain: Cyberwheel | Target domain: CyberBattleSim")
+    
+    if getattr(args, "collect_only", False):
+        print("Collect-only mode: skipping encoder training.")
+        if args.save_data:
+            print(f"  Data saved to {args.save_data}")
+        sys.exit(0)
     
     # Prefer action-as-class when available
     if source_actions_list is not None:
@@ -1077,7 +1555,7 @@ if __name__ == "__main__":
         print("Error: Need samples from both domains!")
         sys.exit(1)
     
-    # Device: explicit --device wins, then --gpu, else auto (cuda if available)
+    # Device: explicit --device wins, then --gpu, else config.device (respects USE_GPU=0)
     if args.device is not None:
         train_device = torch.device(args.device)
     elif args.gpu:
@@ -1086,7 +1564,8 @@ if __name__ == "__main__":
             sys.exit(1)
         train_device = torch.device("cuda")
     else:
-        train_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        from config.device import get_training_device
+        train_device = torch.device(get_training_device())
     print(f"Using device: {train_device}")
     
     # Train with episodic structure

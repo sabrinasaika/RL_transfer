@@ -2,9 +2,22 @@
 
 import gymnasium as gym
 import os
+import sys
+from pathlib import Path
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+def _ensure_cbs_import_path():
+    """CyberBattleSim uses absolute imports like `from cyberbattle._env...`; that only works if
+    the parent of the `cyberbattle` package dir is on sys.path (i.e. .../CyberBattleSim)."""
+    cbs_root = _PROJECT_ROOT / "CyberBattleSim"
+    s = str(cbs_root.resolve())
+    if s not in sys.path:
+        sys.path.insert(0, s)
 
 # --------------------- CYBERBATTLESIM ---------------------
 def make_cbs_env():
+    _ensure_cbs_import_path()
     # Lazy import to avoid requiring CyberBattleSim when only using CyberWheel
     import CyberBattleSim.cyberbattle._env.cyberbattle_env as cbs_env
     # Allow choosing different CBS envs; default to Chain
@@ -17,17 +30,31 @@ def make_cbs_env():
         kwargs["winning_reward"] = 0.0
         kwargs["losing_reward"] = 0.0
     if env_id == "CyberBattleChain-v0":
-        # Relax goal for fast non-zero native rewards
-        kwargs["attacker_goal"] = cbs_env.AttackerGoal(own_atleast_percent=0.1, reward=0)
+        # Use a more challenging goal for evaluation (can be overridden via env vars)
+        goal_pct = float(os.environ.get("CBS_GOAL_OWN_PCT", "0.5"))  # Default 50% ownership
+        goal_reward = float(os.environ.get("CBS_GOAL_REWARD", "50"))  # Default reward threshold
+        kwargs["attacker_goal"] = cbs_env.AttackerGoal(own_atleast_percent=goal_pct, reward=goal_reward)
     # Custom builder: mirror CyberWheel 10-host network topology
     if env_id == "CyberBattleCW10-v0":
         from adapters.cbs_topologies import build_cbs_env_from_cw_yaml
         # Prefer absolute path if available
         yaml_path = os.environ.get(
             "CW_NET_YAML",
-            "/home/ssaika/rl-transfer-sec-clean/cyberwheel/cyberwheel/data/configs/network/10-host-network.yaml",
+            str(_PROJECT_ROOT / "cyberwheel" / "cyberwheel" / "data" / "configs" / "network" / "10-host-network.yaml"),
         )
         return build_cbs_env_from_cw_yaml(yaml_path)
+    # Flat network scenario for credential preference testing
+    if env_id == "CyberBattleFlat-v0" or env_id.startswith("CyberBattleFlat"):
+        from CyberBattleSim.cyberbattle._env.cyberbattle_flat import CyberBattleFlat
+        num_nodes = int(os.environ.get("CBS_FLAT_NODES", "20"))
+        credential_reuse_prob = float(os.environ.get("CBS_CRED_REUSE_PROB", "0.6"))
+        exploit_success_prob = float(os.environ.get("CBS_EXPLOIT_PROB", "0.3"))
+        return CyberBattleFlat(
+            num_nodes=num_nodes,
+            credential_reuse_prob=credential_reuse_prob,
+            exploit_success_prob=exploit_success_prob,
+            **kwargs
+        )
     if env_id == "CyberBattleChain-v0":
         kwargs["size"] = size
     return gym.make(env_id, **kwargs)
@@ -37,8 +64,11 @@ def make_cbs_env():
 CW_ENV_PKG = "cyberwheel.data.configs.environment"
 # CW_DEFAULT_ENV_YAML = "train_rl_red_agent_vs_rl_blue.yaml"  # primary
 # Use a packaged, present YAML that exists in this repo
-CW_DEFAULT_ENV_YAML = "cyberwheel.yaml"
+CW_DEFAULT_ENV_YAML = os.environ.get("CW_ENV_YAML", "cyberwheel.yaml")
 CW_FALLBACK_ENV_YAML = "cyberwheel.yaml"
+
+# Credential preference scenario
+CW_CREDENTIAL_PREFERENCE_YAML = "credential_preference_scenario.yaml"
 
 def make_cw_env():
     import sys, types, yaml
@@ -59,6 +89,9 @@ def make_cw_env():
 
         # Agent config: guarantee keys exist
         agent_cfg = c.get("agent_config", {})
+        # Handle case where agent_config might be a string or other type
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
         red_cfg = (agent_cfg.get("red") if isinstance(agent_cfg, dict) else None) or \
                   c.get("red_agent_config") or c.get("red_agent") or c.get("red") or {}
         blue_cfg = (agent_cfg.get("blue") if isinstance(agent_cfg, dict) else None) or \
@@ -73,7 +106,9 @@ def make_cw_env():
                 return [_to_dict(v) for v in obj]
             return obj
 
-        agent_config_dict = {"red": _to_dict(red_cfg), "blue": _to_dict(blue_cfg)}
+        # Don't set agent_config here - it will be loaded from YAML files in _build_base
+        # Just store the YAML filenames for later loading
+        agent_config_dict = {}  # Will be populated in _build_base
         # Avoid converting agent_config into SimpleNamespace; attach after namespacing
         c.pop("agent_config", None)
 
@@ -89,7 +124,12 @@ def make_cw_env():
             setattr(ns, "red_reward_function", "reward_decoy_hits")
         if not hasattr(ns, "blue_reward_function"):
             setattr(ns, "blue_reward_function", "reward_red_delay")
-        setattr(ns, "agent_config", agent_config_dict)
+        if not hasattr(ns, "network_size_compatibility"):
+            setattr(ns, "network_size_compatibility", "all")
+        # Store YAML filenames separately, not in agent_config yet
+        setattr(ns, "_red_agent_yaml", red_cfg if isinstance(red_cfg, str) else None)
+        setattr(ns, "_blue_agent_yaml", blue_cfg if isinstance(blue_cfg, str) else None)
+        setattr(ns, "agent_config", agent_config_dict)  # Empty dict, will be populated in _build_base
         return ns
 
     def _validate_required_args(args_ns: SimpleNamespace, yaml_name: str):
@@ -103,10 +143,12 @@ def make_cw_env():
                     missing.append(k)
             elif not v or not isinstance(v, (str, bytes)):
                 missing.append(k)
-        # If agent_config not present yet, allow presence of 'agents' to fulfill requirement
+        # If agent_config not present yet, allow presence of 'agents', red_agent/blue_agent, or _red_agent_yaml to fulfill requirement
         ac = getattr(args_ns, "agent_config", None)
         has_agents_block = hasattr(args_ns, "agents")
-        if not ac and not has_agents_block:
+        has_red_agent_yaml = getattr(args_ns, "_red_agent_yaml", None) or getattr(args_ns, "red_agent", None)
+        has_blue_agent_yaml = getattr(args_ns, "_blue_agent_yaml", None) or getattr(args_ns, "blue_agent", None)
+        if not ac and not has_agents_block and not (has_red_agent_yaml or has_blue_agent_yaml):
             missing.append("agent_config or agents")
         if missing:
             raise ValueError(
@@ -132,7 +174,17 @@ def make_cw_env():
                 if len(net_cfg_name) == 0:
                     raise ValueError("empty network_config list")
                 net_cfg_name = net_cfg_name[0]
-            net_cfg_path = _files("cyberwheel.data.configs.network") / net_cfg_name
+            try:
+                net_cfg_path = _files("cyberwheel.data.configs.network") / net_cfg_name
+            except (ModuleNotFoundError, AttributeError, TypeError):
+                # Fallback: use direct file path
+                from pathlib import Path
+                project_root = Path(__file__).parent.parent
+                cw_data_dir = project_root / "cyberwheel" / "cyberwheel" / "data" / "configs" / "network"
+                net_cfg_path = Path(cw_data_dir) / net_cfg_name
+                if not net_cfg_path.exists():
+                    raise FileNotFoundError(f"Could not find network config: {net_cfg_name} (tried {net_cfg_path})")
+                net_cfg_path = str(net_cfg_path)
         except Exception as e:
             raise ValueError(f"[{yaml_name}] Unable to resolve network_config path: {e}")
 
@@ -148,12 +200,17 @@ def make_cw_env():
         try:
             # Load red agent yaml
             red_yaml_name = None
-            agents_obj = getattr(args_ns, "agents", None)
-            if isinstance(agents_obj, SimpleNamespace):
-                agents_obj = vars(agents_obj)
-            if isinstance(agents_obj, dict):
-                red_yaml_name = agents_obj.get("red")
-                blue_yaml_name = agents_obj.get("blue")
+            # First check if we stored the YAML name from _normalize_args
+            red_yaml_name = getattr(args_ns, "_red_agent_yaml", None)
+            blue_yaml_name = getattr(args_ns, "_blue_agent_yaml", None)
+            # Fallback to other sources
+            if not red_yaml_name:
+                agents_obj = getattr(args_ns, "agents", None)
+                if isinstance(agents_obj, SimpleNamespace):
+                    agents_obj = vars(agents_obj)
+                if isinstance(agents_obj, dict):
+                    red_yaml_name = agents_obj.get("red")
+                    blue_yaml_name = agents_obj.get("blue")
             # Also support packaged schema: top-level red_agent / blue_agent
             if not red_yaml_name:
                 red_yaml_name = getattr(args_ns, "red_agent", None)
@@ -164,21 +221,52 @@ def make_cw_env():
                 setattr(args_ns, "agent_config", {})
             agent_cfg_dict = args_ns.agent_config
             if red_yaml_name:
-                red_yaml_path = _files("cyberwheel.data.configs.red_agent").joinpath(red_yaml_name)
-                with red_yaml_path.open("r") as f:
-                    red_yaml = yaml.safe_load(f) or {}
+                try:
+                    red_yaml_path = _files("cyberwheel.data.configs.red_agent").joinpath(red_yaml_name)
+                    with red_yaml_path.open("r") as f:
+                        red_yaml = yaml.safe_load(f) or {}
+                except (ModuleNotFoundError, AttributeError, TypeError):
+                    from pathlib import Path
+                    project_root = Path(__file__).parent.parent
+                    red_yaml_path = project_root / "cyberwheel" / "cyberwheel" / "data" / "configs" / "red_agent" / red_yaml_name
+                    if not red_yaml_path.exists():
+                        # Try alternative path
+                        red_yaml_path = project_root / "cyberwheel" / "cyberwheel" / "data" / "configs" / "red_agent" / red_yaml_name
+                    with open(red_yaml_path, "r") as f:
+                        red_yaml = yaml.safe_load(f) or {}
+                # Ensure red_yaml is a dict, not a string
+                if isinstance(red_yaml, str):
+                    raise ValueError(f"Red agent YAML loaded as string instead of dict: {red_yaml_name}")
+                if not isinstance(red_yaml, dict):
+                    red_yaml = {}
                 agent_cfg_dict["red"] = {**red_yaml, **agent_cfg_dict.get("red", {})}
             if blue_yaml_name:
-                blue_yaml_path = _files("cyberwheel.data.configs.blue_agent").joinpath(blue_yaml_name)
-                with blue_yaml_path.open("r") as f:
-                    blue_yaml = yaml.safe_load(f) or {}
+                try:
+                    blue_yaml_path = _files("cyberwheel.data.configs.blue_agent").joinpath(blue_yaml_name)
+                    with blue_yaml_path.open("r") as f:
+                        blue_yaml = yaml.safe_load(f) or {}
+                except (ModuleNotFoundError, AttributeError, TypeError):
+                    from pathlib import Path
+                    project_root = Path(__file__).parent.parent
+                    blue_yaml_path = project_root / "cyberwheel" / "cyberwheel" / "data" / "configs" / "blue_agent" / blue_yaml_name
+                    with open(blue_yaml_path, "r") as f:
+                        blue_yaml = yaml.safe_load(f) or {}
                 agent_cfg_dict["blue"] = {**blue_yaml, **agent_cfg_dict.get("blue", {})}
 
-            # Ensure required field entry_host
-            if "entry_host" not in agent_cfg_dict.get("red", {}):
-                first_host = sorted(list(network.hosts.keys()))[0] if getattr(network, "hosts", None) else None
-                if first_host:
-                    agent_cfg_dict.setdefault("red", {})["entry_host"] = first_host
+            # Ensure required field entry_host and leader; fix if present but not in this network (e.g. different layout)
+            red_cfg = agent_cfg_dict.setdefault("red", {})
+            host_keys = list((getattr(network, "hosts", None) or {}).keys())
+            if host_keys:
+                host_set = set(host_keys)
+                sorted_hosts = sorted(host_keys)
+                entry = red_cfg.get("entry_host")
+                if not entry or entry not in host_set:
+                    red_cfg["entry_host"] = sorted_hosts[0]
+                leader = red_cfg.get("leader")
+                if leader and isinstance(leader, str) and leader.lower() not in ("random", "random_user", "random_server") and leader not in host_set:
+                    # Prefer first server-like host if any, else first host
+                    server_like = [h for h in sorted_hosts if "server" in h.lower()]
+                    red_cfg["leader"] = server_like[0] if server_like else sorted_hosts[0]
             # Provide a default red strategy if missing (required by ARTAgent)
             agent_cfg_dict.setdefault("red", {})
             agent_cfg_dict["red"].setdefault("strategy", "ServerDowntime")
@@ -229,9 +317,21 @@ def make_cw_env():
         if os.path.isabs(name):
             with open(name, "r") as fh:
                 return yaml.safe_load(fh)
-        path = files(CW_ENV_PKG) / name
-        with path.open("r") as fh:
-            return yaml.safe_load(fh)
+        # Try importlib.resources first, fallback to direct path
+        try:
+            path = files(CW_ENV_PKG) / name
+            with path.open("r") as fh:
+                return yaml.safe_load(fh)
+        except (ModuleNotFoundError, AttributeError, TypeError):
+            # Fallback: use direct file path
+            from pathlib import Path
+            project_root = Path(__file__).parent.parent
+            cw_data_dir = project_root / "cyberwheel" / "cyberwheel" / "data" / "configs" / "environment"
+            yaml_path = cw_data_dir / name
+            if not yaml_path.exists():
+                raise FileNotFoundError(f"Could not find YAML file: {name} (tried {yaml_path})")
+            with open(yaml_path, "r") as fh:
+                return yaml.safe_load(fh)
 
     primary_yaml_name = override_yaml or CW_DEFAULT_ENV_YAML
     try:

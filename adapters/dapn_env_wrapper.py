@@ -41,31 +41,31 @@ class DAPNEnvWrapper(gym.Wrapper):
         import torch
         torch_device = torch.device(device) if device else None
         
-        # Check if we should use full observations (set via env var)
+        # Decide full-obs vs 8D: env var override, or infer from checkpoint (episodic training uses 512D)
         use_full_obs = os.environ.get("DAPN_USE_FULL_OBS", "0") == "1"
-        use_unified_full_obs = os.environ.get("DAPN_USE_UNIFIED_FULL_OBS", "0") == "1"
+        checkpoint_unified_dim = None
+        if encoder_path and os.path.isfile(encoder_path):
+            try:
+                ckpt = torch.load(encoder_path, map_location="cpu", weights_only=False)
+                checkpoint_unified_dim = ckpt.get("input_dim", None)
+                if checkpoint_unified_dim is not None and checkpoint_unified_dim != 8:
+                    use_full_obs = True
+            except Exception:
+                pass
         
         if use_full_obs:
-            if use_unified_full_obs:
-                # Use full observations with SINGLE unified encoder (follows DAPN master)
-                from adapters.dapn_unified_full_obs_translator import DAPNUnifiedFullObsTranslator
-                self.dapn_translator = DAPNUnifiedFullObsTranslator(
-                    use_dapn=use_dapn,
-                    encoder_path=encoder_path,
-                    feature_size=feature_size,
-                    device=torch_device
-                )
-            else:
-                # Use full raw observations with separate encoders
-                from adapters.dapn_full_obs_translator import DAPNFullObservationTranslator
-                self.dapn_translator = DAPNFullObservationTranslator(
-                    use_dapn=use_dapn,
-                    encoder_path=encoder_path,
-                    feature_size=feature_size,
-                    device=torch_device
-                )
+            # Use full observations with SINGLE unified encoder (episodic-trained or DAPN_USE_FULL_OBS=1)
+            from adapters.dapn_unified_full_obs_translator import DAPNUnifiedFullObsTranslator
+            unified_dim = checkpoint_unified_dim if checkpoint_unified_dim is not None else 512
+            self.dapn_translator = DAPNUnifiedFullObsTranslator(
+                use_dapn=use_dapn,
+                encoder_path=encoder_path,
+                feature_size=feature_size,
+                unified_dim=unified_dim,
+                device=torch_device
+            )
         else:
-            # Use 8D unified format with DAPN (default)
+            # Use 8D unified format with DAPN (default for legacy checkpoints)
             self.dapn_translator = DAPNObservationTranslator(
                 use_dapn=use_dapn,
                 encoder_path=encoder_path,
@@ -84,9 +84,9 @@ class DAPNEnvWrapper(gym.Wrapper):
             self.observation_space = spaces.Dict({
                 'mask': self.observation_space['mask'],
                 'obs': spaces.Box(
-                    low=0.0, 
-                    high=1.0, 
-                    shape=(feature_size,), 
+                    low=-np.inf,
+                    high=np.inf,
+                    shape=(feature_size,),
                     dtype=np.float32
                 )
             })
