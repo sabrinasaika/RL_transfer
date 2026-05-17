@@ -30,10 +30,21 @@ def make_cbs_env():
         kwargs["winning_reward"] = 0.0
         kwargs["losing_reward"] = 0.0
     if env_id == "CyberBattleChain-v0":
-        # Use a more challenging goal for evaluation (can be overridden via env vars)
-        goal_pct = float(os.environ.get("CBS_GOAL_OWN_PCT", "0.5"))  # Default 50% ownership
-        goal_reward = float(os.environ.get("CBS_GOAL_REWARD", "50"))  # Default reward threshold
-        kwargs["attacker_goal"] = cbs_env.AttackerGoal(own_atleast_percent=goal_pct, reward=goal_reward)
+        # Win condition: absolute node count takes priority when CBS_WIN_NODES is set.
+        # CBS_WIN_NODES=8 means "own at least 8 chain nodes" (agent starts owning node 0,
+        # so own_atleast=9 means 8 additional chain nodes + the entry node).
+        win_nodes = int(os.environ.get("CBS_WIN_NODES", "0"))
+        if win_nodes > 0:
+            # +1 because node 0 (attacker start) is already owned and counts toward the total
+            kwargs["attacker_goal"] = cbs_env.AttackerGoal(
+                own_atleast=win_nodes + 1,
+                own_atleast_percent=0.0,
+                reward=0,
+            )
+        else:
+            goal_pct = float(os.environ.get("CBS_GOAL_OWN_PCT", "0.5"))  # Default 50% ownership
+            goal_reward = float(os.environ.get("CBS_GOAL_REWARD", "200"))
+            kwargs["attacker_goal"] = cbs_env.AttackerGoal(own_atleast_percent=goal_pct, reward=goal_reward)
     # Custom builder: mirror CyberWheel 10-host network topology
     if env_id == "CyberBattleCW10-v0":
         from adapters.cbs_topologies import build_cbs_env_from_cw_yaml

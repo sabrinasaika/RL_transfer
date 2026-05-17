@@ -80,15 +80,27 @@ class DAPNObservationEncoder(nn.Module):
             nn.Sigmoid()
         )
         
-        # Autoencoder decoder to reconstruct input from embedded features
-        # Helps preserve semantic information while suppressing domain-specific noise
+        # Shared autoencoder decoder — kept for backward compatibility but
+        # NOT trained during DANN (no reconstruction loss in training loop).
         decoder_hidden = max(128, self.__in_features)
         self.decoder = nn.Sequential(
             nn.Linear(self.__in_features, decoder_hidden),
             nn.ReLU(inplace=True),
             nn.Linear(decoder_hidden, input_dim)
         )
-        
+
+        # CW-specific decoder: trained ONLY on source-domain (CW) observations.
+        # Because the encoder is domain-invariant (pair + adversarial losses), a CBS
+        # observation will produce a latent close to the CW latent at the same kill-chain
+        # stage.  Decoding that shared latent through decoder_cw therefore produces a
+        # CW-style observation, which the raw CW policy can interpret correctly.
+        # This is the key fix for cross-domain transfer: CBS → encoder → decoder_cw → CW policy.
+        self.decoder_cw = nn.Sequential(
+            nn.Linear(self.__in_features, decoder_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(decoder_hidden, input_dim)
+        )
+
         # Initialize weights
         self.apply(self._init_weights)
     

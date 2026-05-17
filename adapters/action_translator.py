@@ -4,29 +4,53 @@ import random
 
 class ActionTranslator:
     """
-    3-action unified interface valid in both CyberWheel and CyberBattleSim.
+    6-action unified interface — one action per CyberWheel kill-chain step.
 
-    Action semantics:
-      0  recon    — gather information (sweep / scan / enumerate)
-      1  move     — reach a new node   (lateral movement / connect)
-      2  escalate — gain more power or exfiltrate (priv-esc / impact / local exploit)
+    Actions are defined by their KILL-CHAIN EFFECT (what they achieve),
+    giving a direct 1-to-1 mapping on the CW side and the best available
+    mapping on the CBS side.
 
-    CBS native mapping:
-      recon    → remote_vulnerability  (enumerate a discovered node)
-                 fallback: connect     (reach out when no remote vuln available)
-      move     → connect               (move to a discovered node)
-      escalate → local_vulnerability   (exploit on an owned node)
+      idx  name         CW action               CBS action
+      ---  -----------  ----------------------  ---------------------------
+       0   ping_sweep   ARTPingSweep  (kc=0)    remote_vulnerability
+       1   port_scan    ARTPortScan   (kc=1)    remote_vulnerability
+       2   service_disc ARTDiscovery  (kc=2)    local_vulnerability  (stage 0-1)
+                                                remote_vulnerability (stage 2+)
+       3   move         ARTLateral    (kc=3)    connect
+       4   escalate     ARTPrivEsc    (kc=4)    local_vulnerability
+       5   impact       ARTImpact     (kc=5)    local_vulnerability  (proxy;
+                                                CBS game ends via own_pct goal)
 
-    CW native mapping:
-      recon    → ping_sweep (kc=0) / port_scan (kc=1) / discovery (kc=2)
-                 chosen by what the next unfinished recon step is
-      move     → lateral_move (kc=3)
-      escalate → privilege_escalation (kc=4) / impact (kc=5)
-                 chosen by whether any host still needs escalation
+    CBS collisions are unavoidable: CBS has only 3 action types
+    (remote_vulnerability, connect, local_vulnerability) vs CW's 6.
+    Actions 0 & 1 both → remote_vulnerability; actions 2, 4, 5 all →
+    local_vulnerability (but at different kill-chain stages, so the right
+    CBS action fires at the right time).
+
+    Why is ARTDiscovery (2) stage-aware in CBS?
+      In CyberBattleChain, remote_vulnerability leaks NO credentials.
+      Node discovery requires local_vulnerability on the start node.
+      At stage 0-1, "service_disc" maps to local_vulnerability so the
+      agent actually finds new nodes and leaks the first credential.
+      At stage 2+, "escalate" (4) already handles local_vulnerability;
+      "service_disc" falls back to remote_vulnerability as a probe.
+
+    NOTE: changing from 3 → 6 actions requires retraining the CW policy
+    (action head output size changes). DAPN encoder and observation
+    pipeline are unaffected.
     """
 
     def __init__(self):
-        self.unified_actions = ["recon", "move", "escalate"]
+        self.unified_actions = [
+            "ping_sweep",    # 0  CW kc=0          →  CBS remote_vulnerability
+            "port_scan",     # 1  CW kc=1          →  CBS remote_vulnerability
+            "service_disc",  # 2  CW kc=2          →  CBS local_vuln(s0-1) / remote_vuln(s2+)
+            "move",          # 3  CW kc=3          →  CBS connect
+            "escalate",      # 4  CW kc=4          →  CBS local_vulnerability
+            "impact",        # 5  CW kc=5          →  CBS local_vulnerability (proxy)
+            "nothing",       # 6  CW max_size-1    →  CBS self-probe (no-op)
+                             #    Always valid in CW. Gives policy a safe fallback.
+        ]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -102,27 +126,70 @@ class ActionTranslator:
         except Exception:
             pass
 
-        if name == "recon":
-            # recon = remote probe/scan — always remote_vulnerability, never connect
-            sampled = self._sample_from_mask(action_mask, "remote_vulnerability", 3)
-            if sampled:
-                return {"remote_vulnerability": self._tupleN(sampled, 3)}
-            return {"remote_vulnerability": self._tupleN(base_remote, 3)}
+        def _remote():
+            s = self._sample_from_mask(action_mask, "remote_vulnerability", 3)
+            return {"remote_vulnerability": self._tupleN(s if s else base_remote, 3)}
 
+        def _local():
+            s = self._sample_from_mask(action_mask, "local_vulnerability", 2, prefer_diff=False)
+            return {"local_vulnerability": self._tupleN(s if s else base_local, 2)}
+
+        def _connect():
+            s = self._sample_from_mask(action_mask, "connect", 4)
+            return {"connect": self._tupleN(s if s else base_connect, 4)}
+
+        # ── 0: ping_sweep — broad host scan ──────────────────────────────────
+        if name == "ping_sweep":
+            return _remote()
+
+        # ── 1: port_scan — service enumeration ───────────────────────────────
+        if name == "port_scan":
+            return _remote()
+
+        # ── 2: service_disc — service/node discovery ─────────────────────────
+        # Stage-aware: in CyberBattleChain, node discovery happens via
+        # local_vulnerability (which also leaks credentials). At stage 0-1 this
+        # is the only action that actually makes progress. At stage 2+, "escalate"
+        # handles local_vulnerability; this falls back to remote probing.
+        if name == "service_disc":
+            stage = 0
+            try:
+                if isinstance(last_raw_obs, dict):
+                    from adapters.kill_chain import stage_from_cbs
+                    stage = stage_from_cbs(last_raw_obs)
+            except Exception:
+                stage = 0
+            if stage <= 1:
+                # local_vulnerability: discovers neighbours + leaks first credential
+                s = self._sample_from_mask(action_mask, "local_vulnerability", 2,
+                                           prefer_diff=False)
+                if s:
+                    return {"local_vulnerability": self._tupleN(s, 2)}
+                return _remote()   # fallback if no local available
+            return _remote()       # stage 2+: just probe
+
+        # ── 3: move — lateral movement to a new node ─────────────────────────
         if name == "move":
-            sampled = self._sample_from_mask(action_mask, "connect", 4)
-            if sampled:
-                return {"connect": self._tupleN(sampled, 4)}
-            return {"connect": self._tupleN(base_connect, 4)}
+            return _connect()
 
+        # ── 4: escalate — privilege escalation / credential mining ───────────
         if name == "escalate":
-            sampled = self._sample_from_mask(action_mask, "local_vulnerability", 2, prefer_diff=False)
-            if sampled:
-                return {"local_vulnerability": self._tupleN(sampled, 2)}
-            return {"local_vulnerability": self._tupleN(base_local, 2)}
+            return _local()
+
+        # ── 5: impact — final objective (CBS: proxy via local_vuln) ──────────
+        # CBS game ends automatically when own_atleast_percent is reached.
+        # Using local_vulnerability keeps pressure on owned nodes.
+        if name == "impact":
+            return _local()
+
+        # ── 6: nothing — no-op (CW: always valid; CBS: self-probe of start node) ──
+        # CBS has no true no-op. Probe the start node (index 0) as a safe stand-in;
+        # it has minimal effect and keeps the episode running.
+        if name == "nothing":
+            return {"remote_vulnerability": (0, 0, 0)}
 
         # Fallback — should never reach here
-        return {"local_vulnerability": self._tupleN(base_local, 2)}
+        return _local()
 
     # ------------------------------------------------------------------
     # CW translation
@@ -169,38 +236,49 @@ class ActionTranslator:
                     return random.choice(avail)
             return hosts[0] if hosts else None
 
-        if name == "recon":
-            # Pick the earliest unfinished recon step across any host
-            host = _pick(lambda a: not _bool(a, "sweeped"))
-            if host is None:
-                host = _pick(lambda a: _bool(a, "sweeped") and not _bool(a, "scanned"))
-            if host is None:
-                host = _pick(lambda a: _bool(a, "scanned") and not _bool(a, "discovered"))
-            if host is None:
-                host = _pick(lambda _: True)
-            # Choose kc step
-            attrs = _host_attrs(host) if host else {}
-            if not _bool(attrs, "sweeped"):
-                kc = 0
-            elif not _bool(attrs, "scanned"):
-                kc = 1
-            else:
-                kc = 2
+        # Each unified action maps directly to one CW kill-chain index (kc).
+        # Host selection targets the most appropriate host for each step.
 
-        elif name == "move":
-            host = _pick(lambda a: _bool(a, "discovered") and not _bool(a, "on_host"))
-            if host is None:
-                host = _pick(lambda _: True)
+        if name == "ping_sweep":        # kc=0 — sweep hosts not yet pinged
+            host = _pick(lambda a: not _bool(a, "sweeped")) or _pick(lambda _: True)
+            kc = 0
+
+        elif name == "port_scan":       # kc=1 — scan hosts already swept
+            host = (_pick(lambda a: _bool(a, "sweeped") and not _bool(a, "scanned"))
+                    or _pick(lambda _: True))
+            kc = 1
+
+        elif name == "service_disc":    # kc=2 — discover services on scanned hosts
+            host = (_pick(lambda a: _bool(a, "scanned") and not _bool(a, "discovered"))
+                    or _pick(lambda _: True))
+            kc = 2
+
+        elif name == "move":            # kc=3 — move to a discovered but unvisited host
+            host = (_pick(lambda a: _bool(a, "discovered") and not _bool(a, "on_host"))
+                    or _pick(lambda _: True))
             kc = 3
 
-        else:  # escalate
-            host = _pick(lambda a: _bool(a, "on_host") and not _bool(a, "escalated"))
-            if host is None:
-                host = _pick(lambda a: _bool(a, "escalated") and not _bool(a, "impacted"))
-            if host is None:
-                host = _pick(lambda _: True)
-            attrs = _host_attrs(host) if host else {}
-            kc = 4 if not _bool(attrs, "escalated") else 5
+        elif name == "escalate":        # kc=4 — escalate on the current host
+            host = (_pick(lambda a: _bool(a, "on_host") and not _bool(a, "escalated"))
+                    or _pick(lambda _: True))
+            kc = 4
+
+        elif name == "impact":          # kc=5 — impact on the current, already-escalated host
+            # CW mask ONLY allows kc=4/5 on the current host (on_host==1).
+            # Must prioritise: on_host=1 AND escalated=1 AND not yet impacted.
+            host = (_pick(lambda a: _bool(a, "on_host") and _bool(a, "escalated") and not _bool(a, "impacted"))
+                    or _pick(lambda a: _bool(a, "on_host"))   # current host even if not yet escalated
+                    or _pick(lambda _: True))
+            kc = 5
+
+        elif name == "nothing":         # global no-op — max_size - 1 (always valid in CW)
+            if isinstance(max_size, int) and max_size > 0:
+                return {"red": max_size - 1}
+            return {"red": int(action_idx)}
+
+        else:                           # unknown action — should never be reached
+            host = _pick(lambda _: True)
+            kc = 0
 
         try:
             host_idx = hosts.index(host)

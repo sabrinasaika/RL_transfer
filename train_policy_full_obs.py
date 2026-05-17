@@ -19,6 +19,13 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.callbacks import EvalCallback, CheckpointCallback
 from stable_baselines3.common.evaluation import evaluate_policy
 
+try:
+    import tqdm  # noqa: F401
+    import rich  # noqa: F401
+    _SB3_PROGRESS_BAR = True
+except ImportError:
+    _SB3_PROGRESS_BAR = False
+
 from adapters.unified_env import UnifiedSecEnv
 from adapters.full_obs_translator import FullObservationTranslator
 from config.env_builders import make_cbs_env
@@ -212,7 +219,7 @@ def train_policy(
     model.learn(
         total_timesteps=total_timesteps,
         callback=[eval_callback, checkpoint_callback],
-        progress_bar=True
+        progress_bar=_SB3_PROGRESS_BAR,
     )
     
     # Save final model

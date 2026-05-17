@@ -155,11 +155,18 @@ class DAPNEnvWrapper(gym.Wrapper):
                 'mask': obs['mask']
             }
         else:
-            # Create a dummy mask (all ones) for environments without action masking
-            # This ensures consistency between Cyberwheel and CBS when using DAPN
-            from adapters.action_translator import ActionTranslator
-            num_actions = len(ActionTranslator().unified_actions)
-            mask = np.ones(num_actions, dtype=np.float32)
+            # Compute a semantic kill-chain mask for CW (or fall back to all-valid).
+            # UnifiedSecEnv._compute_unified_mask() now handles both backends:
+            #   CW  → derived from raw obs (which actions are productive at this stage)
+            #   CBS → derived from CBS action_mask dict
+            # This means the policy is trained with meaningful masks on CW, not just
+            # constant all-ones, so it can condition on them correctly during CBS eval.
+            try:
+                mask = self.env._compute_unified_mask()
+            except Exception:
+                from adapters.action_translator import ActionTranslator
+                num_actions = len(ActionTranslator().unified_actions)
+                mask = np.ones(num_actions, dtype=np.float32)
             return {
                 'obs': encoded,
                 'mask': mask

@@ -138,10 +138,11 @@ def evaluate_on_cbs(model_path: str, episodes: int = 10, use_cyberwheel_native: 
 
     env = UnifiedSecEnv("cbs", cbs_factory=make_cbs_env)
     
-    # Enable transfer learning if encoder path provided
+    # Transfer encoding is applied via DAPNEnvWrapper — not by patching env.obs_t here.
+    # If you want DAPN transfer, use eval_cw_dapn_on_cbs.py instead.
     if encoder_path and os.path.exists(encoder_path):
-        env.obs_t = ObservationTranslator(use_transfer=True, encoder_path=encoder_path)
-        print(f"  Using transfer encoder from {encoder_path}")
+        print(f"  Note: encoder_path={encoder_path!r} provided but this script does not "
+              f"apply it. Use eval/eval_cw_dapn_on_cbs.py for DAPN transfer evaluation.")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     if use_cyberwheel_native:

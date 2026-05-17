@@ -9,7 +9,8 @@ Usage:
     # CBS only (if CyberWheel not available):
     python collect_observations.py --num-samples 1000 --out data/obs.npz --cbs-only
 
-    # Use a heuristic policy on CBS to force deeper kill-chain stages:
+    # Use a heuristic policy on BOTH CW and CBS to force all kill-chain
+    # stages (0-4) including "impact" — strongly recommended for DAPN training:
     python collect_observations.py --num-samples 1000 --out data/obs.npz --directed
 
     # Use trained PPO on CBS instead of random/heuristic:
@@ -192,12 +193,32 @@ def _pick_cbs_action(obs: dict, rng: np.random.Generator) -> dict:
     return {"local_vulnerability": (0, 0)}
 
 
-def _collect_directed_cbs(raw_cbs_env, n_samples, seed=None):
+def _fmt_cbs_action(action: dict) -> str:
+    """Format a CBS action dict into a short readable string."""
+    if not isinstance(action, dict):
+        return str(action)
+    (k, v), = action.items()
+    return f"{k}({', '.join(str(x) for x in v)})" if isinstance(v, tuple) else f"{k}({v})"
+
+
+def _cbs_state_snapshot(obs: dict):
+    """Extract key CBS state metrics for debug printing."""
+    disc  = int(obs.get("discovered_node_count", 0) or 0)
+    creds = int(obs.get("credential_cache_length", 0) or 0)
+    priv  = obs.get("nodes_privilegelevel", np.array([], dtype=np.int32))
+    if not isinstance(priv, np.ndarray):
+        priv = np.array(priv, dtype=np.int32) if priv is not None else np.array([], dtype=np.int32)
+    owned = int((priv[1:] >= 1).sum()) if priv.size > 1 else 0  # skip start node
+    return disc, owned, creds
+
+
+def _collect_directed_cbs(raw_cbs_env, n_samples, seed=None, debug=False):
     """
     Collect CBS observations using a stage-aware heuristic policy.
     Operates on the raw CBS env (not UnifiedSecEnv) for direct action control.
 
     raw_cbs_env: the object returned by make_cbs_env()
+    debug: if True, print per-step state transitions.
     """
     rng = np.random.default_rng(seed)
     obs_list = []
@@ -208,13 +229,127 @@ def _collect_directed_cbs(raw_cbs_env, n_samples, seed=None):
         s = (seed + ep) if seed is not None else None
         obs, _ = raw_cbs_env.reset(seed=s)
         done = truncated = False
+        step = 0
 
         while not (done or truncated) and len(obs_list) < n_samples:
             obs_list.append(obs)  # raw CBS obs dict
+
+            stage_before = stage_from_cbs(obs)
+            disc_b, owned_b, creds_b = _cbs_state_snapshot(obs)
+
             action = _pick_cbs_action(obs, rng)
             obs, _, done, truncated, _ = raw_cbs_env.step(action)
+            step += 1
             pbar.update(1)
 
+            # Capture the terminal/winning observation (done=True means the attacker
+            # reached the CBS win condition).  The loop exits before appending it,
+            # so we do it here explicitly — this is the only way to get stage-4 obs.
+            if done and len(obs_list) < n_samples:
+                obs_list.append(obs)
+                pbar.update(1)
+
+            if debug:
+                stage_after = stage_from_cbs(obs)
+                disc_a, owned_a, creds_a = _cbs_state_snapshot(obs)
+                transition = f"s{stage_before}→s{stage_after}"
+                marker = " *** STAGE UP" if stage_after > stage_before else ""
+                print(
+                    f"  [CBS ep={ep+1:>3} step={step:>4}]  {_fmt_cbs_action(action):<40}"
+                    f"  {transition}  disc={disc_a}  owned={owned_a}  creds={creds_a}"
+                    f"{marker}",
+                    flush=True
+                )
+
+        if debug:
+            print(f"  [CBS ep={ep+1:>3}] episode end  done={done}  truncated={truncated}"
+                  f"  total_steps={step}  obs_so_far={len(obs_list)}", flush=True)
+        ep += 1
+
+    pbar.close()
+    return obs_list[:n_samples]
+
+
+def _collect_directed_cw(cw_env, n_samples, seed=None, debug=False):
+    """
+    Collect CW observations using a stage-aware heuristic policy.
+
+    Operates on a UnifiedSecEnv("cw", ...) instance so it can call
+    _compute_unified_mask() for valid-action filtering and access
+    _last_raw_obs for stage detection (same format as _collect_full_episodes).
+
+    Stage → action priority (left = highest priority):
+      Stage 0 (nothing done):   ping_sweep → port_scan → service_disc → move → escalate → impact
+      Stage 1 (recon done):     move → service_disc → port_scan → ping_sweep → escalate → impact
+      Stage 2 (foothold):       escalate → move → service_disc → port_scan → ping_sweep → impact
+      Stage 3 (lateral spread): impact → escalate → move → service_disc → port_scan → ping_sweep
+      Stage 4 (impacted):       nothing  (episode is about to end)
+
+    Indices: 0=ping_sweep, 1=port_scan, 2=service_disc, 3=move,
+             4=escalate, 5=impact, 6=nothing
+    """
+    STAGE_PRIORITY = [
+        [0, 1, 2, 3, 4, 5, 6],  # stage 0: recon first — sweep → scan → discover
+        [1, 2, 3, 0, 4, 5, 6],  # stage 1: port_scan → discover → move; ping_sweep to fill gaps
+        [4, 3, 2, 1, 0, 5, 6],  # stage 2: escalate on current host, spread laterally
+        [5, 4, 3, 2, 1, 0, 6],  # stage 3: impact! then keep escalating / moving
+        [6, 5, 4, 3, 2, 1, 0],  # stage 4: already impacted — no-op until episode ends
+    ]
+
+    obs_list = []
+    pbar = tqdm(total=n_samples, desc="Collecting CW-directed")
+
+    ep = 0
+    while len(obs_list) < n_samples:
+        s = (seed + ep) if seed is not None else None
+        cw_env.reset(seed=s)
+        done = truncated = False
+        step = 0
+
+        while not (done or truncated) and len(obs_list) < n_samples:
+            raw_obs = cw_env._last_raw_obs
+            obs_list.append(raw_obs)
+
+            # Kill-chain stage and valid-action mask for this step
+            stage = stage_from_cw(raw_obs) if raw_obs is not None else 0
+            try:
+                mask = cw_env._compute_unified_mask()
+            except Exception:
+                mask = np.ones(len(cw_env.act_t.unified_actions), dtype=np.float32)
+
+            # Pick highest-priority valid action for this stage
+            priority = STAGE_PRIORITY[min(stage, len(STAGE_PRIORITY) - 1)]
+            action = None
+            for idx in priority:
+                if idx < len(mask) and mask[idx] > 0.5:
+                    action = idx
+                    break
+            if action is None:
+                # Mask says nothing is valid (shouldn't happen) — safe no-op
+                action = len(cw_env.act_t.unified_actions) - 1  # "nothing"
+
+            stage_before = stage
+            _, _, done, truncated, _ = cw_env.step(action)
+            step += 1
+            pbar.update(1)
+
+            if debug:
+                raw_after = cw_env._last_raw_obs
+                stage_after = stage_from_cw(raw_after) if raw_after is not None else 0
+                action_name = cw_env.act_t.unified_actions[action]
+                marker = " *** STAGE UP" if stage_after > stage_before else ""
+                print(
+                    f"  [CW  ep={ep+1:>3} step={step:>4}]  {action_name:<15}"
+                    f"  s{stage_before}→s{stage_after}{marker}",
+                    flush=True,
+                )
+
+        if debug:
+            print(
+                f"  [CW  ep={ep+1:>3}] episode end  done={done}  truncated={truncated}"
+                f"  total_steps={step}  obs_so_far={len(obs_list)}",
+                flush=True,
+            )
         ep += 1
 
     pbar.close()
@@ -285,12 +420,18 @@ def main():
     parser.add_argument("--cbs-only", action="store_true",
                         help="Skip CyberWheel (use if Python < 3.10)")
     parser.add_argument("--directed", action="store_true",
-                        help="Use heuristic CBS policy to force stages 3/4 coverage")
+                        help="Use stage-aware heuristic policy on BOTH CW and CBS "
+                             "to force all kill-chain stages (0-4) including 'impact'. "
+                             "Strongly recommended for DAPN encoder training.")
     parser.add_argument("--cbs-agent", type=str, default=None,
                         help="Path to trained SB3 PPO .zip for CBS rollouts")
     parser.add_argument("--cw-agent", type=str, default=None,
                         help="Path to CyberWheel policy checkpoint (.pt) for rollouts")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--debug-steps", action="store_true",
+                        help="Print per-step state transitions (stage before/after, "
+                             "discovered nodes, owned nodes, credentials) to verify "
+                             "the kill-chain progression during collection.")
     args = parser.parse_args()
 
     cw_agent, cbs_agent = _load_agents(args.cw_agent, args.cbs_agent)
@@ -310,11 +451,22 @@ def main():
         cw_env = None
         try:
             cw_env = UnifiedSecEnv("cw", cw_factory=make_cw_env)
-            cw_obs = _collect_full_episodes(
-                cw_env, n_cw, agent=cw_agent, is_cbs=False, label="CW"
-            )
+            if args.directed:
+                print("  Using directed heuristic policy (stage-aware kill-chain progression)")
+                cw_obs = _collect_directed_cw(cw_env, n_cw, seed=args.seed,
+                                              debug=args.debug_steps)
+            else:
+                if cw_agent is not None:
+                    print("  Using trained CW agent")
+                else:
+                    print("  Using random policy  (tip: --directed for full stage coverage)")
+                cw_obs = _collect_full_episodes(
+                    cw_env, n_cw, agent=cw_agent, is_cbs=False, label="CW",
+                    debug=args.debug_steps
+                )
             print(f"  Collected {len(cw_obs)} CW observations")
         except Exception as e:
+            import traceback; traceback.print_exc()
             print(f"  ERROR: Could not collect CW observations — {e}")
             sys.exit(1)
         finally:
@@ -333,7 +485,8 @@ def main():
         if args.directed:
             print("  Using directed heuristic policy (raw CBS action space)")
             cbs_env = make_cbs_env()   # raw CBS env, not UnifiedSecEnv
-            cbs_raw = _collect_directed_cbs(cbs_env, n_cbs, seed=args.seed)
+            cbs_raw = _collect_directed_cbs(cbs_env, n_cbs, seed=args.seed,
+                                            debug=args.debug_steps)
         else:
             cbs_env = UnifiedSecEnv("cbs", cbs_factory=make_cbs_env)
             if cbs_agent is not None:
@@ -341,7 +494,8 @@ def main():
             else:
                 print("  Using random policy  (tip: --directed for better stage coverage)")
             cbs_raw = _collect_full_episodes(
-                cbs_env, n_cbs, agent=cbs_agent, is_cbs=True, label="CBS"
+                cbs_env, n_cbs, agent=cbs_agent, is_cbs=True, label="CBS",
+                debug=args.debug_steps
             )
 
         # Strip action_mask to avoid OOM when saving

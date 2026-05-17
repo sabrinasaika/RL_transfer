@@ -1,0 +1,17 @@
+
+========================================================================
+ESTIMATE FOR FULL PIPELINE WHEN RUN ON THIS SERVER
+========================================================================
+Host: this server  (calibration run was done on this machine)
+Full run: 500 steps CW + 500 steps CBS + 500 iters encoder (1000 samples).
+------------------------------------------------------------------------
+Username             ProjectName                    CPU%     MEM%     GPU-Util%  Est. Compute Hrs  
+------------------------------------------------------------------------
+ssaika               RL-Transfer-Cyberwheel-CBS     0.0      0.0      0.7        1.1195 (wall)
+========================================================================
+Estimated wall-clock:  67.2 min  (1.1195 hours)
+Est. GPU compute:     0.0082 hours
+Est. CPU compute:     0.0000 hours
+------------------------------------------------------------------------
+Estimated full phase times:  CW 20.2s | CBS 138.4s | Encoder 3871.5s
+========================================================================

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from pydantic import BaseModel, validator, PositiveInt
 from typing import Any, TypeVar, Type
 

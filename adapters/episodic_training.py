@@ -166,12 +166,14 @@ def _action_family_from_action(action) -> str:
         if isinstance(action, (int, np.integer)):
             from adapters.action_translator import ActionTranslator
             name = ActionTranslator().unified_actions[int(action)]
-            if name == "recon":
+            if name in ("ping_sweep", "port_scan", "service_disc"):
                 return "SCAN"
             if name == "move":
                 return "MOVE"
-            if name == "escalate":
+            if name in ("escalate", "impact"):
                 return "EXPLOIT"
+            if name == "nothing":
+                return "NOOP"
     except Exception:
         pass
 

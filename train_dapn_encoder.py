@@ -49,10 +49,38 @@ kill_chain_stage_from_cw  = stage_from_cw
 # =============================================================================
 # Full-episode collection (stage-balanced, unlike reset-only)
 # =============================================================================
-def _collect_full_episodes(env, n_samples, agent=None, is_cbs=False, ep_seed=None, label=""):
+_CW_ACTION_NAMES = {0: "ping_sweep", 1: "port_scan", 2: "service_disc",
+                    3: "move", 4: "escalate", 5: "impact", 6: "nothing"}
+
+
+def _cw_state_snapshot(raw_obs):
+    """Extract CW state metrics from raw red-agent observation vector."""
+    HOST_ATTRS = 7
+    try:
+        vec = np.asarray(raw_obs, dtype=np.float32).ravel()
+        n = vec.size
+        max_hosts = n // HOST_ATTRS
+        disc = on = esc = imp = 0
+        for i in range(max_hosts):
+            chunk = vec[i * HOST_ATTRS: i * HOST_ATTRS + HOST_ATTRS]
+            if np.all(chunk == -1):
+                continue
+            if chunk[3] == 1: disc += 1
+            if chunk[4] == 1: on   += 1
+            if chunk[5] == 1: esc  += 1
+            if chunk[6] == 1: imp  += 1
+        return disc, on, esc, imp
+    except Exception:
+        return 0, 0, 0, 0
+
+
+def _collect_full_episodes(env, n_samples, agent=None, is_cbs=False, ep_seed=None,
+                           label="", debug=False):
     """
     Run full episodes, collecting raw obs at every step so all 5 kill-chain stages
     are represented — not just stage 0/1 seen at reset().
+
+    debug: if True, print per-step state/stage transitions to stdout.
     """
     obs_list = []
     pbar = tqdm(total=n_samples, desc=f"Collecting {label}")
@@ -61,11 +89,21 @@ def _collect_full_episodes(env, n_samples, agent=None, is_cbs=False, ep_seed=Non
         s = (ep_seed + ep) if ep_seed is not None else None
         obs, _ = env.reset(seed=s)
         done = truncated = False
+        step = 0
         while not (done or truncated) and len(obs_list) < n_samples:
-            raw = getattr(env, "_last_raw_obs", None)
+            # _raw_obs holds the current raw CBS dict or CW numpy array inside UnifiedSecEnv
+            raw = getattr(env, "_raw_obs", None)
             if raw is None:
                 raw = obs if (isinstance(obs, dict) if is_cbs else isinstance(obs, np.ndarray)) else ({} if is_cbs else np.array([], dtype=np.float32))
             obs_list.append(raw)
+
+            # Snapshot state BEFORE action for debug
+            if debug:
+                if is_cbs:
+                    stage_before = stage_from_cbs(raw if isinstance(raw, dict) else {})
+                else:
+                    stage_before = stage_from_cw(raw)
+
             if agent is not None:
                 if hasattr(agent, "predict"):
                     from gymnasium import spaces as gym_spaces
@@ -94,7 +132,41 @@ def _collect_full_episodes(env, n_samples, agent=None, is_cbs=False, ep_seed=Non
             else:
                 action = env.action_space.sample()
             obs, _, done, truncated, _ = env.step(action)
+            step += 1
             pbar.update(1)
+
+            # Print step debug line AFTER action
+            if debug:
+                raw_after = getattr(env, "_raw_obs", None) or obs
+                if is_cbs:
+                    stage_after = stage_from_cbs(raw_after if isinstance(raw_after, dict) else {})
+                    disc = int((raw_after or {}).get("discovered_node_count", 0) or 0)
+                    creds = int((raw_after or {}).get("credential_cache_length", 0) or 0)
+                    priv  = np.asarray((raw_after or {}).get("nodes_privilegelevel", []), dtype=np.int32)
+                    owned = int((priv[1:] >= 1).sum()) if priv.size > 1 else 0
+                    marker = " *** STAGE UP" if stage_after > stage_before else ""
+                    print(
+                        f"  [CBS ep={ep+1:>3} step={step:>4}]  action={action:<3}"
+                        f"  s{stage_before}→s{stage_after}"
+                        f"  disc={disc}  owned={owned}  creds={creds}{marker}",
+                        flush=True
+                    )
+                else:
+                    stage_after = stage_from_cw(raw_after)
+                    disc, on, esc, imp = _cw_state_snapshot(raw_after)
+                    act_name = _CW_ACTION_NAMES.get(action, str(action))
+                    marker = " *** STAGE UP" if stage_after > stage_before else ""
+                    print(
+                        f"  [CW  ep={ep+1:>3} step={step:>4}]  {act_name:<10}"
+                        f"  s{stage_before}→s{stage_after}"
+                        f"  disc={disc}  on={on}  esc={esc}  imp={imp}{marker}",
+                        flush=True
+                    )
+
+        if debug:
+            tag = "CBS" if is_cbs else "CW "
+            print(f"  [{tag} ep={ep+1:>3}] episode end  done={done}  truncated={truncated}"
+                  f"  steps={step}  obs_so_far={len(obs_list)}", flush=True)
         ep += 1
     pbar.close()
     return obs_list[:n_samples]
@@ -248,6 +320,8 @@ class BalancedDomainBatchSampler(Sampler):
 class ObservationDataset(Dataset):
     """
     Stores raw observations and converts them to fixed-size 512D tensors on-the-fly.
+    Each item returns (tensor, domain_label, stage_label) so the training loop can
+    compute both domain-adversarial loss and kill-chain stage prediction loss.
     """
     def __init__(self, source_obs_list, target_obs_list, val_obs_list=None,
                  preprocessor=None, norm_mean=None, norm_std=None, clip_z=5.0):
@@ -301,17 +375,23 @@ class ObservationDataset(Dataset):
     def __getitem__(self, idx):
         if idx < len(self.source_obs):
             obs = self.source_obs[idx]
-            label = 0
+            domain = 0
         elif idx < len(self.source_obs) + len(self.target_obs):
             obs = self.target_obs[idx - len(self.source_obs)]
-            label = 1
+            domain = 1
         else:
             obs = self.val_obs[idx - len(self.source_obs) - len(self.target_obs)]
-            label = 2
+            domain = 2
+
+        # Kill-chain stage label — same for both domains (0..KILL_CHAIN_STAGES-1)
+        if isinstance(obs, dict):
+            stage = kill_chain_stage_from_cbs(obs)
+        else:
+            stage = kill_chain_stage_from_cw(obs)
 
         v = self._to_512(obs)
         v = self._normalize(v)
-        return torch.from_numpy(v), label
+        return torch.from_numpy(v), domain, stage
 
 
 # =============================================================================
@@ -535,6 +615,8 @@ def train_dapn_encoder(
     save_path="artifacts/transfer_models/dapn_encoder.pt",
     lambda_adv=0.5,
     lambda_pair=0.1,
+    lambda_stage=1.0,
+    lambda_cw_recon=1.0,
 ):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
@@ -614,22 +696,31 @@ def train_dapn_encoder(
     else:
         print("  Skipping pair loss (no pairs or lambda_pair=0)")
 
-    # Optimizers
-    optimizer_encoder = optim.Adam(encoder_params, lr=learning_rate)
+    # Stage prediction head: shared across both domains.
+    # Forces the encoder to retain kill-chain stage information (0..KILL_CHAIN_STAGES-1)
+    # even while becoming domain-invariant — prevents the "over-invariant encoder" failure.
+    stage_head = nn.Linear(feature_size, KILL_CHAIN_STAGES).to(device)
+    nn.init.xavier_uniform_(stage_head.weight, gain=0.1)
+    nn.init.zeros_(stage_head.bias)
+
+    # Optimizers — stage_head is co-optimised with the encoder
+    optimizer_encoder = optim.Adam(encoder_params + list(stage_head.parameters()), lr=learning_rate)
     optimizer_disc = optim.Adam(translator.domain_adapter.parameters(), lr=learning_rate * 0.1)
 
-    # Loss (logits-based)
+    # Losses
     bce_logits = nn.BCEWithLogitsLoss()
+    ce_stage   = nn.CrossEntropyLoss()
 
     print("\n" + "=" * 80)
-    print("DANN Training")
+    print("DANN Training  (+stage prediction auxiliary loss)")
     print(f"  Source samples: {len(source_obs_list)}")
     print(f"  Target samples: {len(target_obs_list)}")
     print(f"  Val samples:    {len(val_obs_list)} (not used in loss)")
     print(f"  Input: 512D unified vectors  ->  {feature_size}D features")
     print(f"  Batch: {batch_size} (balanced)")
     print(f"  lr encoder: {learning_rate} | lr disc: {learning_rate * 0.1}")
-    print(f"  lambda_adv: {lambda_adv}  lambda_pair: {lambda_pair}")
+    print(f"  lambda_adv: {lambda_adv}  lambda_pair: {lambda_pair}  lambda_stage: {lambda_stage}  lambda_cw_recon: {lambda_cw_recon}")
+    print(f"  Kill-chain stages: {KILL_CHAIN_STAGES}")
     print("=" * 80 + "\n")
 
     pair_iter = iter(pair_loader) if pair_loader is not None else None
@@ -643,18 +734,21 @@ def train_dapn_encoder(
             if translator.cw_encoder is not None:
                 translator.cw_encoder.train()
 
-        total_enc_loss = 0.0
-        total_disc_loss = 0.0
-        total_pair_loss = 0.0
+        total_enc_loss    = 0.0
+        total_disc_loss   = 0.0
+        total_pair_loss   = 0.0
+        total_stage_loss  = 0.0
+        total_recon_loss  = 0.0
         n_batches = 0
         # Reset pair iterator each epoch
         if pair_loader is not None:
             pair_iter = iter(pair_loader)
 
-        for obs_batch, domain_labels in dataloader:
+        for obs_batch, domain_labels, stage_labels in dataloader:
             # Balanced sampler gives only 0 and 1 labels in practice
-            obs_batch = obs_batch.to(device)
+            obs_batch    = obs_batch.to(device)
             domain_labels = domain_labels.to(device)
+            stage_labels  = stage_labels.to(device)
 
             source_mask = (domain_labels == 0)
             target_mask = (domain_labels == 1)
@@ -695,14 +789,42 @@ def train_dapn_encoder(
             optimizer_disc.step()
 
             # -----------------------------
-            # (2) Update encoder to confuse discriminator
-            #     Encoder wants discriminator to fail -> maximize disc loss
-            #     Implemented by minimizing (-disc_loss).
+            # (2) Update encoder to:
+            #     (a) confuse domain discriminator  (-lambda_adv * adv_loss)
+            #     (b) predict kill-chain stage       (+lambda_stage * stage_loss)
+            #     (c) align paired same-stage obs    (+lambda_pair * pair_loss)
+            # The stage loss is the key fix: it prevents the encoder from discarding
+            # task-relevant sequential-attack information while achieving invariance.
             # -----------------------------
             optimizer_encoder.zero_grad()
             logits = translator.domain_adapter(feats)  # no detach, grads flow to encoder
             adv_loss = bce_logits(logits, y_dom)
             enc_loss = -lambda_adv * adv_loss
+
+            # Stage prediction loss — applied to BOTH source and target features
+            stage_loss_val = torch.tensor(0.0, device=device)
+            if lambda_stage > 0:
+                all_feats  = feats          # (batch, feature_size)
+                all_stages = torch.cat([
+                    stage_labels[source_mask],
+                    stage_labels[target_mask],
+                ]).long()                   # (batch,)
+                stage_logits   = stage_head(all_feats)
+                stage_loss_val = ce_stage(stage_logits, all_stages)
+                enc_loss = enc_loss + lambda_stage * stage_loss_val
+
+            # CW reconstruction loss — trains decoder_cw to faithfully map shared
+            # latents back to CW-space observations.  Because the encoder is also
+            # domain-invariant (adv + pair), CBS latents at stage k will be close to
+            # CW latents at stage k, so decoder_cw(encoder(CBS)) ≈ CW obs at stage k.
+            cw_recon_loss_val = torch.tensor(0.0, device=device)
+            if lambda_cw_recon > 0 and source_feat.shape[0] > 0:
+                enc = (translator.shared_encoder if getattr(translator, "use_shared_encoder", False)
+                       else (translator.cw_encoder or translator.cbs_encoder))
+                # decoder_cw: latent → CW obs (trained on source domain only)
+                cw_recon = enc.decoder_cw(source_feat)
+                cw_recon_loss_val = F.mse_loss(cw_recon, obs_batch[source_mask])
+                enc_loss = enc_loss + lambda_cw_recon * cw_recon_loss_val
 
             # Pair alignment loss: same kill-chain stage → same feature space
             pair_loss_val = torch.tensor(0.0, device=device)
@@ -727,34 +849,46 @@ def train_dapn_encoder(
             enc_loss.backward()
             optimizer_encoder.step()
 
-            total_disc_loss += disc_loss.item()
-            total_enc_loss += enc_loss.item()
-            total_pair_loss += pair_loss_val.item()
+            total_disc_loss  += disc_loss.item()
+            total_enc_loss   += enc_loss.item()
+            total_stage_loss += stage_loss_val.item()
+            total_recon_loss += cw_recon_loss_val.item()
+            total_pair_loss  += pair_loss_val.item()
             n_batches += 1
 
         if n_batches == 0:
             print(f"Epoch {epoch+1}: no valid batches (check sampler / data).")
             continue
 
-        avg_disc = total_disc_loss / n_batches
-        avg_enc = total_enc_loss / n_batches
-        avg_pair = total_pair_loss / n_batches
+        avg_disc  = total_disc_loss  / n_batches
+        avg_enc   = total_enc_loss   / n_batches
+        avg_stage = total_stage_loss / n_batches
+        avg_recon = total_recon_loss / n_batches
+        avg_pair  = total_pair_loss  / n_batches
 
         print_freq = 1 if num_epochs <= 20 else 5
         if (epoch + 1) % print_freq == 0 or epoch == 0:
-            print(f"Epoch {epoch+1:>3}/{num_epochs}: disc_loss={avg_disc:.4f} | enc_loss={avg_enc:.4f} | pair_loss={avg_pair:.4f}")
+            print(f"Epoch {epoch+1:>3}/{num_epochs}: disc={avg_disc:.4f} | enc={avg_enc:.4f} "
+                  f"| stage={avg_stage:.4f} | cw_recon={avg_recon:.4f} | pair={avg_pair:.4f}")
 
     # Save encoder + normalization stats so inference uses identical preprocessing
     os.makedirs(os.path.dirname(save_path) if os.path.dirname(save_path) else ".", exist_ok=True)
     translator.save_encoder(save_path)
-    # Patch norm stats into checkpoint so DAPNUnifiedFullObsTranslator can load them
+    # Patch norm stats and stage-head weights into checkpoint
     import torch as _torch
     _ckpt = _torch.load(save_path, map_location="cpu", weights_only=False)
-    _ckpt["norm_mean"] = norm_mean   # shape (512,)
-    _ckpt["norm_std"]  = norm_std    # shape (512,)
-    _ckpt["clip_z"]    = 5.0
+    _ckpt["norm_mean"]             = norm_mean              # shape (512,)
+    _ckpt["norm_std"]              = norm_std               # shape (512,)
+    _ckpt["clip_z"]                = 5.0
+    _ckpt["stage_head_state_dict"]   = stage_head.cpu().state_dict()
+    _ckpt["kill_chain_stages"]       = KILL_CHAIN_STAGES
+    # Save decoder_cw so KCDAPNTranslateWrapper can use it for cross-domain decoding
+    enc = (translator.shared_encoder if getattr(translator, "use_shared_encoder", False)
+           else (translator.cbs_encoder or translator.cw_encoder))
+    if enc is not None and hasattr(enc, "decoder_cw"):
+        _ckpt["decoder_cw_state_dict"] = enc.cpu().decoder_cw.state_dict()
     _torch.save(_ckpt, save_path)
-    print(f"\n✓ Saved trained encoder (+ norm stats) to {save_path}")
+    print(f"\n✓ Saved trained encoder (+ norm stats + stage head) to {save_path}")
     return translator
 
 
@@ -779,7 +913,9 @@ if __name__ == "__main__":
     parser.add_argument("--cbs-agent", type=str, default=None, help="CBS agent path")
     parser.add_argument("--paired-states", action="store_true", help="Pair resets by seed and use CW topology in CBS")
     parser.add_argument("--seed", type=int, default=None, help="Seed base for paired states")
-    parser.add_argument("--lambda-pair", type=float, default=0.1, help="Stage-pair alignment loss weight")
+    parser.add_argument("--lambda-pair",  type=float, default=0.1,  help="Stage-pair alignment loss weight")
+    parser.add_argument("--lambda-stage",    type=float, default=1.0,  help="Kill-chain stage prediction loss weight")
+    parser.add_argument("--lambda-cw-recon", type=float, default=1.0,  help="CW-space reconstruction loss weight (trains decoder_cw)")
 
     args = parser.parse_args()
 
@@ -822,6 +958,8 @@ if __name__ == "__main__":
         save_path=args.save_encoder,
         lambda_adv=args.lambda_adv,
         lambda_pair=args.lambda_pair,
+        lambda_stage=args.lambda_stage,
+        lambda_cw_recon=args.lambda_cw_recon,
     )
 
     print("\n✓ Training complete!")
