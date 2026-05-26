@@ -1,20 +1,20 @@
 """
 Evaluate CW-trained kill-chain policies zero-shot on CyberBattleSim.
 
-Five conditions:
-  1. random              — random action on CBS (lower bound)
-  2. cw_kc_raw           — CW policy trained on 512-D obs, no adaptation
-  3. cw_kc_dapn_det      — CW policy + DAPN obs-translation, deterministic
-  4. cw_kc_dapn_stoch    — CW policy + DAPN obs-translation, stochastic
-  5. cw_kc_finetuned     — CW policy fine-tuned on CBS via DAPN translation
+Four conditions:
+  1. true_random   — random valid action sampled directly from raw CBS action mask
+                     (real lower bound — no kill-chain translation)
+  2. random        — random slot chosen, action resolved via kill-chain translation
+                     (shows translation layer value without a learned policy)
+  3. cw_kc_raw     — CW policy trained on 512-D obs, no DAPN adaptation
+  4. dapn          — CW policy + phase-aware DAPN obs-translation (stochastic)
 
 Usage:
   PYTHONPATH=$PWD:$PWD/cyberwheel:$PWD/CyberBattleSim python3.10 eval_kc_transfer.py
   PYTHONPATH=$PWD:$PWD/cyberwheel:$PWD/CyberBattleSim python3.10 eval_kc_transfer.py \\
-      --raw-policy       artifacts/policies/best_kc_raw/best_model.zip \\
-      --encoder          artifacts/transfer_models/dapn_encoder_v2.pt \\
-      --finetuned-policy artifacts/policies/kc_finetuned/best_finetuned/best_model.zip \\
-      --episodes 20
+      --raw-policy  artifacts/policies/best_kc_raw_12slot/best_kc_raw/best_model.zip \\
+      --encoder     artifacts/transfer_models/dapn_encoder_phase_aware.pt \\
+      --episodes 20 --win-nodes 8
 """
 
 import os, sys, argparse, json
@@ -39,6 +39,12 @@ MAX_EPISODE_STEPS = 500
 def make_base_cbs_env():
     base = UnifiedSecEnv("cbs", cbs_factory=make_cbs_env)
     return TimeLimit(base, max_episode_steps=MAX_EPISODE_STEPS)
+
+
+def make_true_random_cbs_env():
+    """Raw CBS env without UnifiedSecEnv — action space is the real CBS action space."""
+    raw = make_cbs_env()
+    return TimeLimit(raw, max_episode_steps=MAX_EPISODE_STEPS)
 
 
 def make_dapn_cbs_env(encoder_path):
@@ -68,6 +74,115 @@ def _nodes_owned(raw_obs) -> int:
     priv = np.asarray(priv, dtype=np.int32)
     priv_targets = priv[1:] if priv.size > 1 else np.array([], dtype=np.int32)
     return int((priv_targets >= 1).sum())
+
+
+def _sample_valid_cbs_action(env):
+    """Sample a random valid action from the CBS action mask.
+
+    CBS throws on invalid actions by default.  We use compute_action_mask()
+    to restrict sampling to only valid (src, tgt, port, cred / node, vuln) combos.
+    Falls back to a safe local_vulnerability(0,0) if the mask is unavailable.
+    """
+    # Unwrap to find the CBS env that has compute_action_mask
+    inner = env
+    while inner is not None:
+        if hasattr(inner, "compute_action_mask"):
+            break
+        inner = getattr(inner, "env", None)
+
+    if inner is None:
+        return {"local_vulnerability": (0, 0)}
+
+    try:
+        am = inner.compute_action_mask()
+    except Exception:
+        return {"local_vulnerability": (0, 0)}
+
+    # Collect all valid actions across all action types
+    valid = []
+    for key, length in [("connect", 4), ("local_vulnerability", 2), ("remote_vulnerability", 3)]:
+        arr = am.get(key)
+        if arr is None:
+            continue
+        indices = np.argwhere(np.asarray(arr))
+        for idx in indices.tolist():
+            valid.append({key: tuple(int(x) for x in idx[:length])})
+
+    if not valid:
+        return {"local_vulnerability": (0, 0)}
+
+    return valid[np.random.randint(len(valid))]
+
+
+def rollout_true_random(env, n_episodes, max_steps=200, label=""):
+    """True random baseline: sample uniformly from valid raw CBS actions.
+
+    Unlike the 'random' condition which picks a random SLOT and then uses the
+    kill-chain translation layer, this samples directly from the CBS action mask
+    with no kill-chain logic — a genuine lower bound.
+    """
+    returns, steps_list, final_stages = [], [], []
+    nodes_owned_list, win_list, steps_to_first_owned_list = [], [], []
+
+    for ep in range(n_episodes):
+        obs, _ = env.reset(seed=ep)
+        total_r, n_steps = 0.0, 0
+        won = False
+        first_owned_step = None
+
+        for step in range(max_steps):
+            action = _sample_valid_cbs_action(env)
+            try:
+                obs, r, terminated, truncated, _ = env.step(action)
+            except Exception:
+                # Invalid action slipped through — treat as no-op
+                obs, r, terminated, truncated = obs, 0.0, False, False
+            total_r += r
+            n_steps += 1
+
+            if first_owned_step is None and _nodes_owned(obs) > 0:
+                first_owned_step = n_steps
+
+            if terminated:
+                won = True
+                break
+            if truncated:
+                break
+
+        final_stage = stage_from_cbs(obs) if isinstance(obs, dict) else 0
+        n_owned = _nodes_owned(obs)
+
+        returns.append(total_r)
+        steps_list.append(n_steps)
+        final_stages.append(final_stage)
+        nodes_owned_list.append(n_owned)
+        win_list.append(int(won))
+        steps_to_first_owned_list.append(first_owned_step if first_owned_step else max_steps)
+
+    mean_r     = float(np.mean(returns))
+    std_r      = float(np.std(returns))
+    mean_st    = float(np.mean(steps_list))
+    mean_owned = float(np.mean(nodes_owned_list))
+    win_rate   = float(np.mean(win_list))
+    mean_first = float(np.mean(steps_to_first_owned_list))
+    stage_dist = {int(s): int(final_stages.count(s)) for s in sorted(set(final_stages))}
+
+    print(f"\n{label}")
+    print(f"  mean return       : {mean_r:.2f} ± {std_r:.2f}")
+    print(f"  win rate          : {win_rate*100:.0f}%  ({sum(win_list)}/{n_episodes} episodes)")
+    print(f"  nodes owned (avg) : {mean_owned:.2f} / {_total_target_nodes(env)}")
+    print(f"  steps to 1st own  : {mean_first:.1f}")
+    print(f"  mean steps        : {mean_st:.1f}")
+    print(f"  final stages      : {stage_dist}")
+    return {
+        "returns": returns, "steps": steps_list, "final_stages": final_stages,
+        "nodes_owned": nodes_owned_list, "wins": win_list,
+        "steps_to_first_owned": steps_to_first_owned_list,
+        "mean_return": mean_r, "std_return": std_r,
+        "win_rate": win_rate, "mean_nodes_owned": mean_owned,
+        "mean_steps_to_first_owned": mean_first,
+        "stage_dist": stage_dist,
+    }
 
 
 def rollout(env, policy, n_episodes, max_steps=200, deterministic=True, label=""):
@@ -185,34 +300,43 @@ def main():
 
     results = {}
 
-    # ── Condition 1: Random baseline ─────────────────────────────────────────
-    print("\nRunning condition 1/3 — Random baseline...")
+    # ── Condition 1: True random (raw CBS action mask) ────────────────────────
+    print("\nRunning condition 1/4 — True random (raw CBS actions)...")
+    env_true_rand = make_true_random_cbs_env()
+    results["true_random"] = rollout_true_random(
+        env_true_rand, args.episodes, args.max_steps,
+        label="Condition 1 — True Random (raw CBS)"
+    )
+    env_true_rand.close()
+
+    # ── Condition 2: Kill-chain random (random slot + translation) ────────────
+    print("\nRunning condition 2/4 — KC-Random (random slot, kill-chain translation)...")
     env_rand = make_base_cbs_env()
     results["random"] = rollout(env_rand, "random", args.episodes, args.max_steps,
-                                label="Condition 1 — Random")
+                                label="Condition 2 — KC-Random (slot random, action translated)")
     env_rand.close()
 
-    # ── Condition 2: Raw CW policy, no adaptation ─────────────────────────────
-    print("\nRunning condition 2/3 — No DAPN...")
+    # ── Condition 3: Raw CW policy, no adaptation ─────────────────────────────
+    print("\nRunning condition 3/4 — No DAPN...")
     if Path(args.raw_policy).exists():
         policy_raw = PPO.load(args.raw_policy)
         env_raw = make_base_cbs_env()
         results["cw_kc_raw"] = rollout(
             env_raw, policy_raw, args.episodes, args.max_steps, deterministic=True,
-            label="Condition 2 — No DAPN"
+            label="Condition 3 — No DAPN"
         )
         env_raw.close()
     else:
         print(f"  [skip] not found: {args.raw_policy}")
 
-    # ── Condition 3: DAPN (stochastic) ───────────────────────────────────────
-    print("\nRunning condition 3/3 — DAPN...")
+    # ── Condition 4: DAPN (stochastic) ───────────────────────────────────────
+    print("\nRunning condition 4/4 — DAPN...")
     if Path(args.raw_policy).exists() and Path(args.encoder).exists():
         policy_dapn = PPO.load(args.raw_policy)
         env_dapn = make_dapn_cbs_env(args.encoder)
         results["dapn"] = rollout(
             env_dapn, policy_dapn, args.episodes, args.max_steps, deterministic=False,
-            label="Condition 3 — DAPN"
+            label="Condition 4 — DAPN"
         )
         env_dapn.close()
     else:
@@ -226,12 +350,13 @@ def main():
 
     # ── Summary table ─────────────────────────────────────────────────────────
     print("\n── Summary ─────────────────────────────────────────────────────────────────")
-    print(f"  {'Condition':<12}  {'WinRate':>7}  {'NodesOwned':>10}  {'StepsTo1st':>10}  {'MeanReturn':>10}")
-    print(f"  {'-'*12}  {'-'*7}  {'-'*10}  {'-'*10}  {'-'*10}")
+    print(f"  {'Condition':<20}  {'WinRate':>7}  {'NodesOwned':>10}  {'StepsTo1st':>10}  {'MeanReturn':>10}")
+    print(f"  {'-'*20}  {'-'*7}  {'-'*10}  {'-'*10}  {'-'*10}")
     conditions = [
-        ("random",    "Random      "),
-        ("cw_kc_raw", "No DAPN     "),
-        ("dapn",      "DAPN        "),
+        ("true_random", "True Random         "),
+        ("random",      "KC-Random           "),
+        ("cw_kc_raw",   "No DAPN             "),
+        ("dapn",        "DAPN                "),
     ]
     for key, label in conditions:
         if key in results:

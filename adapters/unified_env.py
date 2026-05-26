@@ -169,6 +169,10 @@ class UnifiedSecEnv(gym.Env):
         backend_action = self._ensure_valid_backend_action(backend_action)
 
         raw_obs, raw_r, terminated, truncated, info = self.env.step(backend_action)
+        # Store the actual backend action so wrappers / trace scripts can read it
+        if info is None:
+            info = {}
+        info["cbs_action"] = backend_action
 
         # Snapshot CW mutable list
         if self.backend == "cw" and isinstance(raw_obs, dict):

@@ -40,7 +40,30 @@ PHASE_NAMES = {
 }
 
 def phase_name(p):
-    return PHASE_NAMES.get(p, f"phase{p}")
+    return PHASE_NAMES.get(int(p), f"phase{p}")
+
+
+def _fmt_cbs_action(action: dict) -> str:
+    """Format a CBS backend action dict into a readable string.
+
+    Examples:
+      {"local_vulnerability":  (3, 1)}        → "local_vuln  (node=3, vuln=1)"
+      {"remote_vulnerability": (0, 4, 2)}      → "remote_vuln (src=0, tgt=4, vuln=2)"
+      {"connect":              (2, 3, 0, 1)}   → "connect     (src=2 → tgt=3, port=0, cred=1)"
+    """
+    if not isinstance(action, dict) or not action:
+        return "(no action)"
+    key, val = next(iter(action.items()))
+    if key == "local_vulnerability":
+        node, vuln = val
+        return f"local_vuln  (node={node}, vuln_idx={vuln})"
+    if key == "remote_vulnerability":
+        src, tgt, vuln = val
+        return f"remote_vuln (src={src} → tgt={tgt}, vuln_idx={vuln})"
+    if key == "connect":
+        src, tgt, port, cred = val
+        return f"connect     (src={src} → tgt={tgt}, port={port}, cred={cred})"
+    return f"{key}{val}"
 
 
 def _get_unified_env(env):
@@ -111,13 +134,8 @@ def run_trace(env, policy, episode, max_steps, win_nodes, cbs_size, deterministi
         obs, r, terminated, truncated, info = env.step(slot)
         total_r += r
 
-        # What CBS action was generated (info may carry it, else reconstruct)
-        cbs_action_str = info.get("cbs_action", "")
-        if not cbs_action_str and unified is not None:
-            # Re-read from unified env's last dispatched action via slot map
-            slot_map = getattr(unified, "_slot_map", [])
-            node_id = slot_map[slot] if slot < len(slot_map) else "?"
-            cbs_action_str = f"slot {slot} → node {node_id}"
+        # Format the actual CBS action that was sent to the environment
+        cbs_action_str = _fmt_cbs_action(info.get("cbs_action", {}))
 
         # Current owned nodes
         owned_now = set(_owned_nodes(unified, cbs_size)) if unified else set()
@@ -233,7 +251,8 @@ def main():
                 owned_now = set(_owned_nodes(unified, args.cbs_size)) if unified else set()
                 newly_owned = owned_now - prev_owned
                 new_tag = f"  ◀ node(s) {sorted(newly_owned)} OWNED" if newly_owned else ""
-                print(f"  {step+1:>4}  {action:>4}  {'(random sample)':<40}  "
+                cbs_act = _fmt_cbs_action(info.get("cbs_action", {}))
+                print(f"  {step+1:>4}  {action:>4}  {cbs_act:<40}  "
                       f"{len(owned_now):>5}  {r:>8.1f}{new_tag}")
                 prev_owned = owned_now
                 if terminated:

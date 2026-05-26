@@ -1,0 +1,213 @@
+{
+  "true_random": {
+    "returns": [
+      366.0,
+      267.0,
+      154.0,
+      152.0,
+      267.0
+    ],
+    "steps": [
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "final_stages": [
+      3,
+      3,
+      2,
+      2,
+      3
+    ],
+    "nodes_owned": [
+      3,
+      2,
+      1,
+      1,
+      2
+    ],
+    "wins": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "steps_to_first_owned": [
+      14,
+      29,
+      33,
+      4,
+      39
+    ],
+    "mean_return": 241.2,
+    "std_return": 80.58138742910798,
+    "win_rate": 0.0,
+    "mean_nodes_owned": 1.8,
+    "mean_steps_to_first_owned": 23.8,
+    "stage_dist": {
+      "2": 2,
+      "3": 3
+    }
+  },
+  "random": {
+    "returns": [
+      6005.0,
+      923.0,
+      6029.0,
+      909.0,
+      6023.0
+    ],
+    "steps": [
+      98,
+      200,
+      162,
+      200,
+      165
+    ],
+    "final_stages": [
+      4,
+      3,
+      4,
+      3,
+      4
+    ],
+    "nodes_owned": [
+      8,
+      7,
+      8,
+      7,
+      8
+    ],
+    "wins": [
+      1,
+      0,
+      1,
+      0,
+      1
+    ],
+    "steps_to_first_owned": [
+      18,
+      38,
+      10,
+      14,
+      9
+    ],
+    "mean_return": 3977.8,
+    "std_return": 2499.965631763765,
+    "win_rate": 0.6,
+    "mean_nodes_owned": 7.6,
+    "mean_steps_to_first_owned": 17.8,
+    "stage_dist": {
+      "3": 2,
+      "4": 3
+    }
+  },
+  "cw_kc_raw": {
+    "returns": [
+      19.0,
+      19.0,
+      19.0,
+      19.0,
+      19.0
+    ],
+    "steps": [
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "final_stages": [
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "nodes_owned": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "wins": [
+      0,
+      0,
+      0,
+      0,
+      0
+    ],
+    "steps_to_first_owned": [
+      200,
+      200,
+      200,
+      200,
+      200
+    ],
+    "mean_return": 19.0,
+    "std_return": 0.0,
+    "win_rate": 0.0,
+    "mean_nodes_owned": 0.0,
+    "mean_steps_to_first_owned": 200.0,
+    "stage_dist": {
+      "1": 5
+    }
+  },
+  "dapn": {
+    "returns": [
+      6023.0,
+      6023.0,
+      6023.0,
+      909.0,
+      6029.0
+    ],
+    "steps": [
+      177,
+      181,
+      146,
+      200,
+      161
+    ],
+    "final_stages": [
+      4,
+      4,
+      4,
+      3,
+      4
+    ],
+    "nodes_owned": [
+      8,
+      8,
+      8,
+      7,
+      8
+    ],
+    "wins": [
+      1,
+      1,
+      1,
+      0,
+      1
+    ],
+    "steps_to_first_owned": [
+      29,
+      29,
+      4,
+      2,
+      32
+    ],
+    "mean_return": 5001.4,
+    "std_return": 2046.2013195186832,
+    "win_rate": 0.8,
+    "mean_nodes_owned": 7.8,
+    "mean_steps_to_first_owned": 19.2,
+    "stage_dist": {
+      "3": 1,
+      "4": 4
+    }
+  }
+}
