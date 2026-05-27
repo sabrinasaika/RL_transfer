@@ -38,6 +38,49 @@ from adapters.kill_chain import stage_from_cbs, stage_from_cw, KILL_CHAIN_STAGES
 import torch.nn.functional as F
 
 
+# =============================================================================
+# V2 phase injection — derives phase features from real CBS state
+# =============================================================================
+def _inject_v2_phases(raw_dict: dict) -> dict:
+    """
+    Replace nodes_privilegelevel with v2-style phase features derived from
+    real CBS state (no fake phase counter):
+      owned (priv >= 1)    → 1.00
+      creds in cache       → 0.75
+      not yet probed       → 0.00
+
+    Returns a shallow copy of raw_dict with the modified field.
+    """
+    if not isinstance(raw_dict, dict):
+        return raw_dict
+    priv_raw = raw_dict.get("nodes_privilegelevel")
+    if priv_raw is None:
+        return raw_dict
+
+    priv = np.array(priv_raw, dtype=np.float32)
+
+    # Find nodes with credentials in the CBS credential cache
+    cred_cache = raw_dict.get("credential_cache_matrix")
+    cred_len   = int(raw_dict.get("credential_cache_length") or 0)
+    cred_nodes: set = set()
+    if cred_cache is not None and cred_len > 0:
+        cred_arr = np.asarray(cred_cache)
+        for i in range(min(cred_len, cred_arr.shape[0])):
+            cred_nodes.add(int(cred_arr[i, 0]))
+
+    for node_id in range(len(priv)):
+        if priv[node_id] >= 1:
+            priv[node_id] = 1.00   # owned
+        elif node_id in cred_nodes:
+            priv[node_id] = 0.75   # creds found, exploit-ready
+        else:
+            priv[node_id] = 0.00   # not yet probed
+
+    obs_copy = dict(raw_dict)
+    obs_copy["nodes_privilegelevel"] = priv
+    return obs_copy
+
+
 # Legacy aliases so rest of file is unchanged
 kill_chain_stage_from_cbs = stage_from_cbs
 kill_chain_stage_from_cw  = stage_from_cw
@@ -241,7 +284,8 @@ def build_stage_pairs(source_obs_list, target_obs_list):
 class PairedObservationDataset(Dataset):
     """Dataset of (src_512d, tgt_512d) pairs for MSE alignment loss."""
 
-    def __init__(self, paired_src, paired_tgt, preprocessor, norm_mean, norm_std, clip_z=5.0):
+    def __init__(self, paired_src, paired_tgt, preprocessor, norm_mean, norm_std,
+                 clip_z=5.0, use_v2_obs=False):
         assert len(paired_src) == len(paired_tgt)
         self.paired_src = paired_src
         self.paired_tgt = paired_tgt
@@ -249,9 +293,12 @@ class PairedObservationDataset(Dataset):
         self.norm_mean = norm_mean
         self.norm_std = norm_std
         self.clip_z = clip_z
+        self.use_v2_obs = use_v2_obs
 
     def _to_512_norm(self, obs):
         if isinstance(obs, dict):
+            if self.use_v2_obs:
+                obs = _inject_v2_phases(obs)
             v = self.preprocessor.preprocess_cbs(obs)
         else:
             v = self.preprocessor.preprocess_cw(obs)
@@ -324,7 +371,8 @@ class ObservationDataset(Dataset):
     compute both domain-adversarial loss and kill-chain stage prediction loss.
     """
     def __init__(self, source_obs_list, target_obs_list, val_obs_list=None,
-                 preprocessor=None, norm_mean=None, norm_std=None, clip_z=5.0):
+                 preprocessor=None, norm_mean=None, norm_std=None, clip_z=5.0,
+                 use_v2_obs=False):
         self.source_obs = source_obs_list
         self.target_obs = target_obs_list
         self.val_obs = val_obs_list or []
@@ -338,6 +386,7 @@ class ObservationDataset(Dataset):
         self.norm_mean = norm_mean
         self.norm_std = norm_std
         self.clip_z = clip_z
+        self.use_v2_obs = use_v2_obs
 
     def __len__(self):
         return self.total_samples
@@ -345,6 +394,8 @@ class ObservationDataset(Dataset):
     def _to_512(self, obs):
         # CBS raw obs is dict
         if isinstance(obs, dict):
+            if self.use_v2_obs:
+                obs = _inject_v2_phases(obs)
             v = self.preprocessor.preprocess_cbs(obs)
         # CW raw obs is numpy array
         elif isinstance(obs, np.ndarray):
@@ -617,6 +668,7 @@ def train_dapn_encoder(
     lambda_pair=0.1,
     lambda_stage=1.0,
     lambda_cw_recon=1.0,
+    use_v2_obs=False,
 ):
     device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training on device: {device}")
@@ -663,6 +715,9 @@ def train_dapn_encoder(
     translator.domain_adapter.train()
 
     # Dataset + balanced batches (source/target only; val is kept but not batched here)
+    if use_v2_obs:
+        print("  [v2-obs] Applying real CBS state phase injection (0 / 0.75 / 1.0)")
+
     dataset = ObservationDataset(
         source_obs_list,
         target_obs_list,
@@ -671,6 +726,7 @@ def train_dapn_encoder(
         norm_mean=norm_mean,
         norm_std=norm_std,
         clip_z=5.0,
+        use_v2_obs=use_v2_obs,
     )
 
     sampler = BalancedDomainBatchSampler(
@@ -688,7 +744,8 @@ def train_dapn_encoder(
     pair_loader = None
     if len(paired_src) > 0 and lambda_pair > 0:
         pair_dataset = PairedObservationDataset(
-            paired_src, paired_tgt, preprocessor, norm_mean, norm_std, clip_z=5.0
+            paired_src, paired_tgt, preprocessor, norm_mean, norm_std, clip_z=5.0,
+            use_v2_obs=use_v2_obs,
         )
         pair_loader = DataLoader(pair_dataset, batch_size=batch_size, shuffle=True,
                                  drop_last=True, num_workers=0)
@@ -916,6 +973,8 @@ if __name__ == "__main__":
     parser.add_argument("--lambda-pair",  type=float, default=0.1,  help="Stage-pair alignment loss weight")
     parser.add_argument("--lambda-stage",    type=float, default=1.0,  help="Kill-chain stage prediction loss weight")
     parser.add_argument("--lambda-cw-recon", type=float, default=1.0,  help="CW-space reconstruction loss weight (trains decoder_cw)")
+    parser.add_argument("--v2-obs", action="store_true",
+                        help="Use v2-style CBS obs (real state phase injection: 0/0.75/1.0 instead of fake counter)")
 
     args = parser.parse_args()
 
@@ -960,6 +1019,7 @@ if __name__ == "__main__":
         lambda_pair=args.lambda_pair,
         lambda_stage=args.lambda_stage,
         lambda_cw_recon=args.lambda_cw_recon,
+        use_v2_obs=args.v2_obs,
     )
 
     print("\n✓ Training complete!")

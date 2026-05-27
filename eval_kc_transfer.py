@@ -53,6 +53,19 @@ def make_dapn_cbs_env(encoder_path):
     return KCDAPNTranslateWrapper(base, encoder_path=encoder_path, device="cpu")
 
 
+def make_base_cbs_env_v2():
+    from adapters.unified_env_v2 import UnifiedSecEnvV2
+    base = UnifiedSecEnvV2("cbs", cbs_factory=make_cbs_env)
+    return TimeLimit(base, max_episode_steps=MAX_EPISODE_STEPS)
+
+
+def make_dapn_cbs_env_v2(encoder_path):
+    from adapters.unified_env_v2 import UnifiedSecEnvV2
+    base = UnifiedSecEnvV2("cbs", cbs_factory=make_cbs_env)
+    base = TimeLimit(base, max_episode_steps=MAX_EPISODE_STEPS)
+    return KCDAPNTranslateWrapper(base, encoder_path=encoder_path, device="cpu")
+
+
 def _get_raw_obs(env):
     """Unwrap env layers to find the UnifiedSecEnv with _raw_obs."""
     e = env
