@@ -241,11 +241,13 @@ train_dapn_encoder.py         # Step 2: train DAPN encoder
 eval_kc_transfer.py           # Step 3: 4-condition transfer evaluation
 finetune_kc_cbs.py            # Step 4: few-shot CBS fine-tuning
 trace_policy.py               # Step-by-step policy visualisation
+test_action_translation.py    # Verify kill-chain action translation (259 tests)
 
 artifacts/
   policies/best_kc_raw_12slot/best_kc_raw/best_model.zip  # CW policy
   transfer_models/dapn_encoder_phase_aware.pt              # DAPN encoder
 
 results/
-  kc_eval_4cond.json          # 4-condition eval results
+  kc_eval.json                # 4-condition eval results
+  trajectory_plot.png         # Phase heatmap + ownership timeline
 ```
