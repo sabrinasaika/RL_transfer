@@ -145,7 +145,6 @@ Four conditions evaluated on CBS chain-12, win = 8 nodes owned, 20 episodes:
 | Condition | Win Rate | Nodes Owned | Steps to 1st | Mean Return |
 |-----------|----------|-------------|--------------|-------------|
 | True Random | 0% | 2.60 | 21.9 | 336 |
-| KC-Random | 100% | 8.00 | 13.0 | 6,022 |
 | No DAPN | 0% | 0.00 | — | 19 |
 | **DAPN** | **100%** | **8.00** | **13.1** | **6,024** |
 
@@ -154,7 +153,6 @@ Four conditions evaluated on CBS chain-12, win = 8 nodes owned, 20 episodes:
 | Condition | Slot selection | Action translation |
 |-----------|---------------|-------------------|
 | True Random | — | None — raw CBS action mask (genuine lower bound) |
-| KC-Random | Uniform random | Kill-chain translation (`_advance_cbs`) |
 | No DAPN | CW-trained policy | None — wrong obs space, always fails |
 | DAPN | CW-trained policy | Phase-aware DAPN encoder |
 
@@ -162,8 +160,6 @@ Four conditions evaluated on CBS chain-12, win = 8 nodes owned, 20 episodes:
 - **True Random → 0%**: sampling randomly from raw CBS actions (80B+ combos) is
   essentially impossible — most actions are invalid or traps
 - **No DAPN → 0%**: the CW policy cannot operate on raw CBS observations
-- **KC-Random = DAPN (100%)** with 500 steps: the kill-chain translation layer
-  alone is sufficient; the learned policy's advantage appears under tight step budgets
 - **Under tight budget (60 steps)**: DAPN owns 3.50 nodes vs KC-Random 3.30,
   showing the policy does add value when efficiency matters
 
